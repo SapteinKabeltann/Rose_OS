@@ -1,6 +1,7 @@
 # RoseOS for ESP32 LilyGo T5 E-Paper
 
 A lightweight operating system for LilyGo T5 2.13" e-paper display.
+<img width="1124" height="588" alt="image" src="https://github.com/user-attachments/assets/f200fd69-c481-4fcd-9b14-afa81a451ee4" />
 
 ## 📁 Folder Structure
 
