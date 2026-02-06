@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="no">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>RoseOS Controller</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg-primary: #0f0f1a;
+            --bg-secondary: #1a1a2e;
+            --bg-card: rgba(255, 255, 255, 0.05);
+            --accent: #fd79a8;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0b0;
+            --border: rgba(255, 255, 255, 0.1);
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+            min-height: 100vh;
+            color: var(--text-primary);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 400px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            font-size: 32px;
+            margin-bottom: 5px;
+            background: linear-gradient(45deg, #fd79a8, #a29bfe);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .status {
+            font-size: 14px;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #00b894;
+            box-shadow: 0 0 10px #00b894;
+        }
+
+        .card {
+            background: var(--bg-card);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        }
+
+        .title {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-secondary);
+            margin-bottom: 15px;
+            font-weight: 700;
+        }
+
+        .nav-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+
+        .btn {
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            color: white;
+            padding: 20px;
+            border-radius: 15px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .btn:active {
+            transform: scale(0.95);
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .btn i {
+            font-size: 24px;
+            margin-bottom: 5px;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: #000;
+            border: none;
+            box-shadow: 0 5px 15px rgba(253, 121, 168, 0.3);
+        }
+
+        .btn-full {
+            grid-column: span 2;
+        }
+
+        .input-group {
+            position: relative;
+        }
+
+        input {
+            width: 100%;
+            padding: 15px 50px 15px 15px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: white;
+            font-size: 16px;
+            outline: none;
+        }
+
+        .send-btn {
+            position: absolute;
+            right: 5px;
+            top: 5px;
+            bottom: 5px;
+            width: 40px;
+            background: var(--accent);
+            border: none;
+            border-radius: 8px;
+            color: #000;
+            font-size: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+        }
+
+        .quick-actions {
+            display: flex;
+            gap: 10px;
+            overflow-x: auto;
+            padding-bottom: 5px;
+            margin-top: 15px;
+        }
+
+        .chip {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 13px;
+            white-space: nowrap;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>RoseOS</h1>
+            <div class="status">
+                <div class="dot" id="status-dot"></div> <span id="status-text">Not connected</span>
+            </div>
+        </header>
+
+        <div class="card">
+            <div class="title">ESP32 Connection</div>
+            <div class="input-group">
+                <input type="text" id="ipInput" placeholder="ESP32 IP (e.g. 192.168.1.100)"
+                    onkeypress="handleIPEnter(event)">
+                <button class="send-btn" onclick="connectESP()">✓</button>
+            </div>
+            <div class="quick-actions" style="margin-top: 10px;">
+                <div class="chip" onclick="testConnection()">🔍 Test Connection</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="title">Navigation</div>
+            <div class="nav-grid">
+                <button class="btn" onclick="cmd('CMD:BUTTON')">
+                    <span>👆</span> Short Press
+                </button>
+                <button class="btn" onclick="cmd('CMD:BUTTON:LONG')">
+                    <span>👇</span> Long Press
+                </button>
+                <button class="btn btn-full" onclick="cmd('CMD:APP:EXIT')">
+                    <span>🚪</span> Exit App
+                </button>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="title">Send Note / Text</div>
+            <div class="input-group">
+                <input type="text" id="textInput" placeholder="Type message..." onkeypress="handleEnter(event)">
+                <button class="send-btn" onclick="sendText()">➤</button>
+            </div>
+            <div class="quick-actions">
+                <div class="chip" onclick="setInput('Hello World')">Hello World</div>
+                <div class="chip" onclick="setInput('Reminder: ')">Reminder</div>
+                <div class="chip" onclick="setInput('Meeting at ')">Meeting</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="title">System</div>
+            <div class="nav-grid">
+                <button class="btn" onclick="cmd('CMD:SYSTEM:INFO')">ℹ️ Info</button>
+                <button class="btn" onclick="cmd('CMD:SD:REFRESH')">🔄 Refresh Apps</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ESP32 IP from localStorage or empty
+        let deviceIP = localStorage.getItem('esp32_ip') || '';
+        const ipInput = document.getElementById('ipInput');
+        ipInput.value = deviceIP;
+
+        updateStatus();
+
+        function updateStatus() {
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('status-text');
+
+            if (deviceIP) {
+                text.innerText = 'Connected: ' + deviceIP;
+                dot.style.background = '#00b894';
+                dot.style.boxShadow = '0 0 10px #00b894';
+            } else {
+                text.innerText = 'Enter ESP32 IP';
+                dot.style.background = '#fdcb6e';
+                dot.style.boxShadow = '0 0 10px #fdcb6e';
+            }
+        }
+
+        function connectESP() {
+            const ip = ipInput.value.trim();
+            if (ip) {
+                deviceIP = ip;
+                localStorage.setItem('esp32_ip', ip);
+                updateStatus();
+                testConnection();
+            }
+        }
+
+        function handleIPEnter(e) {
+            if (e.key === 'Enter') connectESP();
+        }
+
+        function testConnection() {
+            if (!deviceIP) {
+                alert('Please enter ESP32 IP address first');
+                return;
+            }
+
+            const url = 'http://' + deviceIP + '/api/cmd?q=CMD:SYSTEM:INFO';
+            fetch(url)
+                .then(res => {
+                    if (res.ok) {
+                        alert('✅ Connected to ESP32 at ' + deviceIP);
+                        document.getElementById('status-dot').style.background = '#00b894';
+                    } else {
+                        alert('❌ ESP32 responded with error');
+                    }
+                })
+                .catch(err => {
+                    alert('❌ Cannot reach ESP32 at ' + deviceIP + '\n\nMake sure:\n• ESP32 is on the same network\n• IP address is correct\n• ESP32 web server is running');
+                    document.getElementById('status-dot').style.background = '#e74c3c';
+                });
+        }
+
+        function cmd(command) {
+            if (!deviceIP) {
+                alert('Please enter ESP32 IP address first');
+                return;
+            }
+
+            const url = 'http://' + deviceIP + '/api/cmd?q=' + encodeURIComponent(command);
+            fetch(url)
+                .then(res => console.log('OK:', command))
+                .catch(err => console.error('Error:', err));
+        }
+
+        function sendText() {
+            const input = document.getElementById('textInput');
+            if (input.value.trim()) {
+                cmd('CMD:TEXT:' + input.value);
+                input.value = '';
+            }
+        }
+
+        function setInput(text) {
+            document.getElementById('textInput').value = text;
+            document.getElementById('textInput').focus();
+        }
+
+        function handleEnter(e) {
+            if (e.key === 'Enter') sendText();
+        }
+    </script>
+</body>
+
+</html>

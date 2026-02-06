@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>RoseOS Controller</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        :root {
+            --bg-primary: #0f0f1a;
+            --bg-secondary: #1a1a2e;
+            --bg-card: rgba(255, 255, 255, 0.05);
+            --accent: #6c5ce7;
+            --accent-glow: rgba(108, 92, 231, 0.3);
+            --success: #00b894;
+            --warning: #fdcb6e;
+            --danger: #e17055;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0b0;
+            --border: rgba(255, 255, 255, 0.1);
+        }
+        
+        body {
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+            min-height: 100vh;
+            color: var(--text-primary);
+            padding: 20px;
+            padding-bottom: 100px;
+        }
+        
+        .container {
+            max-width: 500px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 25px;
+        }
+        
+        h1 {
+            font-size: 28px;
+            background: linear-gradient(135deg, #6c5ce7, #a29bfe);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 5px;
+        }
+        
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+        
+        .card {
+            background: var(--bg-card);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .card h2 {
+            font-size: 16px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .card h2 .icon {
+            font-size: 20px;
+        }
+        
+        .status-bar {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            margin-bottom: 15px;
+        }
+        
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            padding: 6px 12px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 20px;
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--danger);
+        }
+        
+        .status-dot.connected {
+            background: var(--success);
+            box-shadow: 0 0 8px var(--success);
+        }
+        
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            width: 100%;
+            margin-bottom: 10px;
+        }
+        
+        .btn:last-child {
+            margin-bottom: 0;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent), #a29bfe);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px var(--accent-glow);
+        }
+        
+        .btn-success {
+            background: linear-gradient(135deg, var(--success), #55efc4);
+            color: white;
+        }
+        
+        .btn-danger {
+            background: linear-gradient(135deg, var(--danger), #fab1a0);
+            color: white;
+        }
+        
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+        
+        .input-group {
+            margin-bottom: 15px;
+        }
+        
+        .input-group label {
+            display: block;
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+        
+        .input-group input {
+            width: 100%;
+            padding: 12px 16px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+        
+        .input-group input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        
+        .input-group input::placeholder {
+            color: var(--text-secondary);
+        }
+        
+        .app-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        
+        .app-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            border: 1px solid transparent;
+            transition: all 0.2s;
+        }
+        
+        .app-item:hover {
+            border-color: var(--accent);
+            background: rgba(108, 92, 231, 0.1);
+        }
+        
+        .app-item .name {
+            font-weight: 500;
+        }
+        
+        .app-item .btn {
+            width: auto;
+            padding: 8px 16px;
+            margin: 0;
+            font-size: 12px;
+        }
+        
+        .log-area {
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 10px;
+            padding: 15px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+            color: var(--text-secondary);
+        }
+        
+        .log-entry {
+            margin-bottom: 4px;
+            padding: 2px 0;
+        }
+        
+        .log-entry.tx {
+            color: var(--success);
+        }
+        
+        .log-entry.rx {
+            color: #74b9ff;
+        }
+        
+        .log-entry.error {
+            color: var(--danger);
+        }
+        
+        .button-row {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .button-row .btn {
+            flex: 1;
+        }
+        
+        .info-box {
+            background: rgba(108, 92, 231, 0.15);
+            border: 1px solid rgba(108, 92, 231, 0.3);
+            border-radius: 10px;
+            padding: 12px 16px;
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 15px;
+        }
+        
+        .info-box strong {
+            color: var(--text-primary);
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 30px;
+            color: var(--text-secondary);
+        }
+        
+        .empty-state .icon {
+            font-size: 40px;
+            margin-bottom: 10px;
+        }
+        
+        #compatibility-warning {
+            display: none;
+            background: rgba(225, 112, 85, 0.2);
+            border: 1px solid var(--danger);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+            font-size: 13px;
+        }
+        
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        /* Responsive */
+        @media (max-width: 400px) {
+            body {
+                padding: 15px;
+            }
+            
+            h1 {
+                font-size: 24px;
+            }
+            
+            .card {
+                padding: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🖥️ RoseOS</h1>
+            <p class="subtitle">Web Bluetooth Controller</p>
+        </header>
+        
+        <div id="compatibility-warning">
+            ⚠️ <strong>Web Bluetooth ikke støttet</strong><br>
+            Bruk Chrome, Edge, eller Opera på Android, Windows, Mac, eller Linux.
+            Safari/iOS støttes dessverre ikke.
+        </div>
+        
+        <!-- Connection Card -->
+        <div class="card">
+            <h2><span class="icon">📡</span> Tilkobling</h2>
+            
+            <div class="status-bar">
+                <div class="status-item">
+                    <span class="status-dot" id="ble-status"></span>
+                    <span id="ble-status-text">Frakoblet</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-dot" id="wifi-status"></span>
+                    <span id="wifi-status-text">WiFi ukjent</span>
+                </div>
+            </div>
+            
+            <button class="btn btn-primary" id="connect-btn" onclick="toggleConnection()">
+                🔗 Koble til RoseOS
+            </button>
+        </div>
+        
+        <!-- WiFi Configuration -->
+        <div class="card" id="wifi-card" style="display: none;">
+            <h2><span class="icon">📶</span> WiFi-innstillinger</h2>
+            
+            <div class="input-group">
+                <label>Nettverksnavn (SSID)</label>
+                <input type="text" id="wifi-ssid" placeholder="Mitt WiFi-nettverk">
+            </div>
+            
+            <div class="input-group">
+                <label>Passord</label>
+                <input type="password" id="wifi-password" placeholder="••••••••">
+            </div>
+            
+            <div class="button-row">
+                <button class="btn btn-success" onclick="saveWiFi()">💾 Lagre</button>
+                <button class="btn btn-primary" onclick="connectWiFi()">🔌 Koble til</button>
+            </div>
+            
+            <div style="margin-top: 10px;">
+                <button class="btn btn-secondary" onclick="getWiFiStatus()">📊 Sjekk status</button>
+            </div>
+        </div>
+        
+        <!-- Apps -->
+        <div class="card" id="apps-card" style="display: none;">
+            <h2><span class="icon">📱</span> Apper</h2>
+            
+            <div class="button-row" style="margin-bottom: 15px;">
+                <button class="btn btn-secondary" onclick="refreshApps()">🔄 Oppdater liste</button>
+            </div>
+            
+            <div id="app-list" class="app-list">
+                <div class="empty-state">
+                    <div class="icon">📭</div>
+                    <p>Trykk "Oppdater liste" for å hente apper</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Quick Actions -->
+        <div class="card" id="actions-card" style="display: none;">
+            <h2><span class="icon">⚡</span> Raske handlinger</h2>
+            
+            <div class="button-row">
+                <button class="btn btn-secondary" onclick="sendCommand('CMD:BUTTON')">
+                    👆 Kort trykk
+                </button>
+                <button class="btn btn-secondary" onclick="sendCommand('CMD:BUTTON:LONG')">
+                    👇 Langt trykk
+                </button>
+            </div>
+            
+            <button class="btn btn-secondary" onclick="sendCommand('CMD:SYSTEM:INFO')">
+                ℹ️ Systeminformasjon
+            </button>
+            
+            <button class="btn btn-secondary" onclick="sendCommand('CMD:APP:EXIT')">
+                🚪 Avslutt app
+            </button>
+        </div>
+        
+        <!-- Text Input -->
+        <div class="card" id="text-card" style="display: none;">
+            <h2><span class="icon">✏️</span> Send tekst</h2>
+            
+            <div class="info-box">
+                Send tekst til aktiv app (f.eks. Notes-appen)
+            </div>
+            
+            <div class="input-group">
+                <label>Melding</label>
+                <input type="text" id="text-input" placeholder="Skriv din melding...">
+            </div>
+            
+            <button class="btn btn-primary" onclick="sendText()">
+                📤 Send
+            </button>
+        </div>
+        
+        <!-- Log -->
+        <div class="card">
+            <h2><span class="icon">📋</span> Logg</h2>
+            <div class="log-area" id="log">
+                <div class="log-entry">Klar til å koble til...</div>
+            </div>
+            <button class="btn btn-secondary" onclick="clearLog()" style="margin-top: 10px;">
+                🗑️ Tøm logg
+            </button>
+        </div>
+    </div>
+    
+    <script>
+        // BLE UUIDs
+        const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+        const CHARACTERISTIC_UUID_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+        const CHARACTERISTIC_UUID_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+        
+        // State
+        let device = null;
+        let server = null;
+        let rxCharacteristic = null;
+        let txCharacteristic = null;
+        let connected = false;
+        
+        // Check Web Bluetooth support
+        if (!navigator.bluetooth) {
+            document.getElementById('compatibility-warning').style.display = 'block';
+            document.getElementById('connect-btn').disabled = true;
+        }
+        
+        // Logging
+        function log(message, type = 'info') {
+            const logArea = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry ' + type;
+            const time = new Date().toLocaleTimeString('no-NO', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            entry.textContent = `[${time}] ${message}`;
+            logArea.appendChild(entry);
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+        
+        function clearLog() {
+            document.getElementById('log').innerHTML = '<div class="log-entry">Logg tømt</div>';
+        }
+        
+        // Connection
+        async function toggleConnection() {
+            if (connected) {
+                disconnect();
+            } else {
+                await connect();
+            }
+        }
+        
+        async function connect() {
+            try {
+                log('Søker etter RoseOS...', 'info');
+                
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{ name: 'RoseOS' }],
+                    optionalServices: [SERVICE_UUID]
+                });
+                
+                log('Fant enhet: ' + device.name, 'info');
+                
+                device.addEventListener('gattserverdisconnected', onDisconnected);
+                
+                log('Kobler til GATT server...', 'info');
+                server = await device.gatt.connect();
+                
+                log('Henter service...', 'info');
+                const service = await server.getPrimaryService(SERVICE_UUID);
+                
+                log('Henter characteristics...', 'info');
+                rxCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID_RX);
+                txCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID_TX);
+                
+                // Subscribe to notifications
+                await txCharacteristic.startNotifications();
+                txCharacteristic.addEventListener('characteristicvaluechanged', onDataReceived);
+                
+                connected = true;
+                updateConnectionUI(true);
+                log('✅ Tilkoblet!', 'rx');
+                
+                // Get initial status
+                setTimeout(() => {
+                    sendCommand('CMD:SYSTEM:INFO');
+                    sendCommand('CMD:WIFI:STATUS');
+                }, 500);
+                
+            } catch (error) {
+                log('❌ Feil: ' + error.message, 'error');
+                connected = false;
+                updateConnectionUI(false);
+            }
+        }
+        
+        function disconnect() {
+            if (device && device.gatt.connected) {
+                device.gatt.disconnect();
+            }
+            connected = false;
+            updateConnectionUI(false);
+            log('Frakoblet', 'info');
+        }
+        
+        function onDisconnected() {
+            connected = false;
+            updateConnectionUI(false);
+            log('⚠️ Tilkobling mistet', 'error');
+        }
+        
+        function updateConnectionUI(isConnected) {
+            const btn = document.getElementById('connect-btn');
+            const statusDot = document.getElementById('ble-status');
+            const statusText = document.getElementById('ble-status-text');
+            
+            if (isConnected) {
+                btn.textContent = '🔌 Koble fra';
+                btn.classList.remove('btn-primary');
+                btn.classList.add('btn-danger');
+                statusDot.classList.add('connected');
+                statusText.textContent = 'Tilkoblet';
+                
+                // Show other cards
+                document.getElementById('wifi-card').style.display = 'block';
+                document.getElementById('apps-card').style.display = 'block';
+                document.getElementById('actions-card').style.display = 'block';
+                document.getElementById('text-card').style.display = 'block';
+            } else {
+                btn.textContent = '🔗 Koble til RoseOS';
+                btn.classList.remove('btn-danger');
+                btn.classList.add('btn-primary');
+                statusDot.classList.remove('connected');
+                statusText.textContent = 'Frakoblet';
+                
+                // Hide other cards
+                document.getElementById('wifi-card').style.display = 'none';
+                document.getElementById('apps-card').style.display = 'none';
+                document.getElementById('actions-card').style.display = 'none';
+                document.getElementById('text-card').style.display = 'none';
+            }
+        }
+        
+        // Data handling
+        function onDataReceived(event) {
+            const decoder = new TextDecoder('utf-8');
+            const value = decoder.decode(event.target.value);
+            log('← ' + value, 'rx');
+            
+            // Parse responses
+            if (value.startsWith('STATUS:')) {
+                const status = value.substring(7);
+                const wifiDot = document.getElementById('wifi-status');
+                const wifiText = document.getElementById('wifi-status-text');
+                
+                if (status.includes('Connected') || status.includes('IP:')) {
+                    wifiDot.classList.add('connected');
+                    wifiText.textContent = status.replace('Connected to ', '').split(' ')[0];
+                } else {
+                    wifiDot.classList.remove('connected');
+                    wifiText.textContent = 'Ikke tilkoblet';
+                }
+            }
+            else if (value.startsWith('APPS:')) {
+                const apps = value.substring(5);
+                updateAppList(apps);
+            }
+            else if (value.startsWith('INFO:')) {
+                // System info received - already logged
+            }
+        }
+        
+        async function sendCommand(cmd) {
+            if (!connected || !rxCharacteristic) {
+                log('❌ Ikke tilkoblet', 'error');
+                return;
+            }
+            
+            try {
+                const encoder = new TextEncoder();
+                await rxCharacteristic.writeValue(encoder.encode(cmd));
+                log('→ ' + cmd, 'tx');
+            } catch (error) {
+                log('❌ Sendefeil: ' + error.message, 'error');
+            }
+        }
+        
+        // WiFi functions
+        async function saveWiFi() {
+            const ssid = document.getElementById('wifi-ssid').value;
+            const pass = document.getElementById('wifi-password').value;
+            
+            if (!ssid) {
+                log('❌ Skriv inn SSID', 'error');
+                return;
+            }
+            
+            await sendCommand('CMD:WIFI:SSID:' + ssid);
+            await new Promise(r => setTimeout(r, 300));
+            await sendCommand('CMD:WIFI:PASS:' + pass);
+        }
+        
+        async function connectWiFi() {
+            await sendCommand('CMD:WIFI:CONNECT');
+        }
+        
+        async function getWiFiStatus() {
+            await sendCommand('CMD:WIFI:STATUS');
+        }
+        
+        // App functions
+        async function refreshApps() {
+            await sendCommand('CMD:APP:LIST');
+        }
+        
+        function updateAppList(appsString) {
+            const container = document.getElementById('app-list');
+            
+            if (appsString === '(none)' || !appsString) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="icon">📭</div>
+                        <p>Ingen apper funnet</p>
+                        <p style="font-size: 12px; margin-top: 5px;">Legg til .lua filer i /apps/ på SD-kortet</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            const apps = appsString.split(',');
+            container.innerHTML = apps.map(app => `
+                <div class="app-item">
+                    <span class="name">📦 ${app}</span>
+                    <button class="btn btn-success" onclick="launchApp('${app}')">▶️ Start</button>
+                </div>
+            `).join('');
+        }
+        
+        async function launchApp(appName) {
+            await sendCommand('CMD:APP:RUN:' + appName);
+        }
+        
+        // Text input
+        async function sendText() {
+            const text = document.getElementById('text-input').value;
+            if (!text) {
+                log('❌ Skriv inn tekst', 'error');
+                return;
+            }
+            
+            await sendCommand('CMD:TEXT:' + text);
+            document.getElementById('text-input').value = '';
+        }
+        
+        // Enter key support for inputs
+        document.getElementById('text-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendText();
+        });
+        
+        document.getElementById('wifi-password').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') connectWiFi();
+        });
+    </script>
+</body>
+</html>
