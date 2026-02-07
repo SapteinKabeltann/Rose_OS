@@ -3,7 +3,17 @@
 
 local Screen = require("hal.screen")
 local Keyboard = require("hal.keyboard")
-local WiFi = require("hal.wifi")
+-- WiFi lastes ved første bruk (lazy). ensureWiFi() kobler til hvis config.wifi_ssid er satt.
+local WiFi = nil  -- modul eller false ved feil
+local function getWiFi()
+    if WiFi == false then return nil end
+    if WiFi then return WiFi end
+    ensureWiFi()
+    local ok, w = pcall(require, "hal.wifi")
+    if not ok or not w then WiFi = false; return nil end
+    WiFi = w
+    return WiFi
+end
 
 local Terminal = {}
 local LINE_H = 10
@@ -61,8 +71,15 @@ local function runInfo()
 end
 
 local function runWifi()
-    local status = WiFi:getStatus()
-    local ip = WiFi:getIP()
+    local w = getWiFi()
+    if not w then
+        addOutput("-- WiFi --")
+        addOutput("Ikke tilgjengelig (lavt minne?)")
+        addOutput("")
+        return
+    end
+    local status = w:getStatus()
+    local ip = w:getIP()
     addOutput("-- WiFi --")
     addOutput("Status: " .. status)
     addOutput("IP: " .. (ip ~= "" and ip or "(ikke koblet)"))
@@ -163,6 +180,10 @@ function Terminal:loop()
 
     local key = Keyboard:getKey()
     if not key then return end
+
+    if key == "LONG_ENTER_5SEC" then
+        return "exit"
+    end
 
     if remoteMode then
         if key == "LONG_ENTER" then

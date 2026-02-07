@@ -27,16 +27,33 @@ Rose_OS/                 # Project folder
 
 ### 2. Flash firmware to ESP32
 
-1. Open `RoseOS.ino` in Arduino IDE
-2. Install required libraries (see below)
-3. Select board: **ESP32 Dev Module**
-4. Select correct COM port
-5. Go to Tools > Partition Scheme > Big App (No OTA) !!!IMPORTANT!!!
-6. Upload
+1. Open **RoseBox.ino** i Arduino IDE
+2. Installer nødvendige biblioteker (se under)
+3. Velg kort: **ESP32 Dev Module**
+4. Velg riktig COM-port
+5. Gå til **Tools → Partition Scheme → Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)** eller **Big App (No OTA)** (avhengig av board package – LittleFS må ha plass)
+6. **Upload** (kompiler og last opp sketch)
 
-### 3. Prepare SD card (optional)
+### 3. Last opp Lua-filer til Flash – viktig
 
-**Note:** The 5 built-in apps work **without SD card**!
+Uten dette får du feilmeldingen **«module 'hal.screen' not found»**.
+
+1. I Arduino IDE: **Tools → ESP32 Sketch Data Upload** (eller **LittleFS Data Upload** / **SPIFFS Data Upload** avhengig av board/plugin).
+2. Dette laster opp mappen **data/** til flash: **bootstrap.lua** (én fil: hjem + åpne/lukke app), **main.lua**, **hal/*.lua**, **apps/*.lua**, **config.lua**.
+3. RoseBox leser fra **både LittleFS og SPIFFS**. Ved **LittleFS Filesystem Upload** (f.eks. earlephilhower som bruker `huge_app`):
+   - **Viktig:** Velg **samme Partition Scheme** når du bygger sketch som når du kjører LittleFS-opplasting. I Arduino IDE: **Tools → Partition Scheme** – velg det som tilsvarer `huge_app` (f.eks. **«Huge APP (3MB No OTA/1MB SPIFFS)»** eller liknende). Bygg og last opp **sketch** med dette valget, deretter **Tools → ESP32 LittleFS Data Upload**.
+   - Ved oppstart skriver RoseBox til Serial om LittleFS er montert og om `/bootstrap.lua`, `/main.lua`, `/config.lua`, `/hal/screen.lua` **finnes** eller **MANGLER**. Ser du «LittleFS: mount failed» eller «MANGLER», bygg sketch på nytt med riktig Partition Scheme og last opp sketch + LittleFS igjen.
+   - Koden bruker `LittleFS.begin(false)` så partisjonen aldri formateres ved oppstart.
+
+**Minimal boot:** Ved oppstart kjører RoseBox **bootstrap.lua** (én fil med hjem-meny, åpne/lukke app). Ved **Lang trykk** lastes kun den valgte appen (f.eks. `require("apps.terminal")`) – ingen ekstra bootstrap_core. BLE og WiFi (C++) er aktive fra setup(). Hvis bootstrap feiler, faller firmware tilbake til **main.lua**.  
+
+**Hvis du får «not enough memory»:** Det er **RAM (heap)** som er tom. Med splittet bootstrap lastes minimalt ved boot; bootstrap_core og apper lastes on demand. For å se ledig heap: i `RoseBox.ino` sett `LUA_HEAP_DEBUG 1`.
+
+**Legge til nye Lua-apper:** Du trenger ikke endre C++ eller bootstrap_core. 1) Lag `data/apps/minapp.lua` som returnerer en tabell med `:start()` og `:loop()` (se f.eks. `clock.lua`). 2) Legg `"minapp"` inn i listen i `data/bootstrap.lua`: `_G.appList = { "terminal", "clock", "settings", "apps", "minapp" }`. 3) Last opp data på nytt. Appen lastes først når brukeren åpner den; når de lukker, frigjøres minnet. Ny app = ingen ekstra minne ved oppstart.
+
+### 4. SD-kort (valgfritt)
+
+De innebygde appene (Terminal, Clock, Settings, Apps) fungerer **uten SD-kort** når Lua-filene er lastet opp til LittleFS (steg 3).
 
 SD card is only needed for:
 - Photo app (to display images from `/images/`)
@@ -91,8 +108,10 @@ To send commands via Bluetooth (e.g. for WiFi setup), I recommend **Serial Bluet
 - [Download for Android (Google Play)](https://play.google.com/store/apps/details?id=de.kai_morich.serial_bluetooth_terminal)
 
 **Usage:**
-1. Open app and connect to device **RoseOS**
+1. Open app and connect to device **RoseBox** (BLE-navn)
 2. Send commands (see list below)
+
+**Hvis du får GATT status 147:** Prøv «Forget device» / «Glem enhet» på telefonen og koble til på nytt. Enheten krever ikke paring.
 
 ## 🌐 WiFi Web Controller
 

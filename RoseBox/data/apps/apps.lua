@@ -85,6 +85,10 @@ function Apps:loop()
     local key = Keyboard:getKey()
     if not key then return end
 
+    if key == "LONG_ENTER_5SEC" then
+        return "exit"
+    end
+
     if key == "LONG_ENTER" then
         local name
         if selectedSide == 1 and intern[selectedIndex] then

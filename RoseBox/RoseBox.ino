@@ -31,12 +31,33 @@
 #include <SPI.h>
 #include <SD.h>
 #include <LittleFS.h>
+#include <SPIFFS.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include <GxEPD2_BW.h>
 #include "icons.h"
 #include "home.h"
+#include "embedded_lua.h"
+
+// Øk stack for loop-task (Lua + display + BLE bruker mye – unngår abort/stack overflow på core 1)
+size_t getArduinoLoopTaskStackSize(void) {
+    return 16384;
+}
+
+// BLE (Nordic UART) – samme UUID som RoseOS for kompatibilitet
+#define BLE_SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define BLE_CHAR_UUID_RX        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define BLE_CHAR_UUID_TX        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+static BLEServer* pBLEServer = nullptr;
+static BLECharacteristic* pBLETxChar = nullptr;
+static bool bleDeviceConnected = false;
+static bool bleOldDeviceConnected = false;
 
 // Display settings (lagres i NVS, som RoseOS)
 static bool displayInverted = false;
@@ -54,6 +75,9 @@ static int partialUpdateCount = 0;
 // TF/SD Card Pins (LilyGo T5 - bak på kortet: CS 13, MOSI 15, SCK 14, MISO 2)
 #define SD_CS     13
 
+// Battery voltage (ADC med spenningsdeler på LilyGo T5)
+#define BATTERY_PIN 35
+
 GxEPD2_BW<GxEPD2_213_BN, GxEPD2_213_BN::HEIGHT> display(
     GxEPD2_213_BN(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
@@ -69,7 +93,22 @@ extern "C" {
 lua_State *L = nullptr;
 bool luaReady = false;
 bool sdReady = false;
+bool littlefsReady = false;
+bool spiffsReady = false;  // Sketch Data Upload bruker ofte SPIFFS-partisjon
 WiFiClient tcpClient;
+
+// WiFi lagret for BLE-kommandoer (CMD:WIFI:SSID/PASS:CONNECT)
+static String wifiStoredSSID = "";
+static String wifiStoredPass = "";
+
+// BLE: buffer for linjedelte kommandoer (én kommando per linje)
+static String bleRxBuffer = "";
+
+// Forward for BLE
+static void processBLECommand(String cmd);
+static void initBLE();
+static void bleSend(String msg);
+static void handleBLEConnection();
 
 // --- GPIO Bindings ---
 static int l_gpio_mode(lua_State *L) {
@@ -96,6 +135,189 @@ static int l_gpio_read(lua_State *L) {
 // Software-inversjon: EPD_FG = forgrunn (normalt svart), EPD_BG = bakgrunn (normalt hvit)
 static inline uint16_t EPD_FG() { return displayInverted ? GxEPD_WHITE : GxEPD_BLACK; }
 static inline uint16_t EPD_BG() { return displayInverted ? GxEPD_BLACK : GxEPD_WHITE; }
+
+// Batteri (LiPo 4.0V = 100%, 3.0V = 0%)
+static int getBatteryPercent() {
+    int raw = analogRead(BATTERY_PIN);
+    float voltage = (raw / 4095.0f) * 3.3f * 2.0f;
+    float percent = ((voltage - 3.0f) / (4.0f - 3.0f)) * 100.0f;
+    if (percent > 100) percent = 100;
+    if (percent < 0) percent = 0;
+    return (int)percent;
+}
+
+static void drawBatteryIcon(int x, int y) {
+    int percent = getBatteryPercent();
+    display.drawBitmap(x, y, epd_bitmap_Battery, 20, 10, EPD_FG());
+    int bars = (percent + 12) / 25;
+    const int barWidth = 3, barGap = 1, barHeight = 6;
+    int startBarX = x + 2, startBarY = y + 2;
+    for (int i = 0; i < bars && i < 4; i++) {
+        int bx = startBarX + i * (barWidth + barGap);
+        display.fillRect(bx, startBarY, barWidth, barHeight, EPD_FG());
+    }
+}
+
+// --- BLE callbacks (unngår GATT 147 ved å ikke kreve pairing) ---
+class RoseBoxBLEServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) override {
+        bleDeviceConnected = true;
+        Serial.println("BLE: Client connected");
+    }
+    void onDisconnect(BLEServer* pServer) override {
+        bleDeviceConnected = false;
+        Serial.println("BLE: Client disconnected");
+    }
+};
+
+class RoseBoxBLERxCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) override {
+        std::string rx = pCharacteristic->getValue();
+        if (rx.length() == 0) return;
+        bleRxBuffer += String(rx.c_str());
+        // Prosesser kommandoer: splitt på linjeskift eller på neste "CMD:" (flere kommandoer i én pakke)
+        while (bleRxBuffer.length() > 0) {
+            int idxLn = bleRxBuffer.indexOf('\n');
+            if (idxLn < 0) idxLn = bleRxBuffer.indexOf('\r');
+            int idxCmd = (bleRxBuffer.startsWith("CMD:")) ? bleRxBuffer.indexOf("CMD:", 4) : -1;
+            int idx = -1;
+            bool useLn = (idxLn >= 0 && (idxCmd < 0 || idxLn <= idxCmd));
+            bool useCmd = (idxCmd >= 0 && (idxLn < 0 || idxCmd < idxLn));
+            if (useLn) idx = idxLn;
+            else if (useCmd) idx = idxCmd;
+            if (idx < 0) break;
+            String line = bleRxBuffer.substring(0, idx);
+            if (useLn) {
+                bleRxBuffer = bleRxBuffer.substring(idx + 1);
+                if (bleRxBuffer.length() > 0 && (bleRxBuffer[0] == '\n' || bleRxBuffer[0] == '\r')) bleRxBuffer = bleRxBuffer.substring(1);
+            } else {
+                bleRxBuffer = bleRxBuffer.substring(idx);
+            }
+            line.trim();
+            if (line.length() > 0) {
+                Serial.println("BLE RX: " + line);
+                processBLECommand(line);
+            }
+        }
+        // Enkelt kommando uten linjeskift (f.eks. bare CMD:WIFI:PASS:xxx)
+        bleRxBuffer.trim();
+        if (bleRxBuffer.length() > 0 && bleRxBuffer.startsWith("CMD:")) {
+            Serial.println("BLE RX: " + bleRxBuffer);
+            processBLECommand(bleRxBuffer);
+            bleRxBuffer = "";
+        }
+        if (bleRxBuffer.length() > 512) bleRxBuffer = bleRxBuffer.substring(bleRxBuffer.length() - 256);
+    }
+};
+
+static void initBLE() {
+    Serial.println("Initializing BLE...");
+    BLEDevice::setMTU(185);
+    BLEDevice::init("RoseBox");
+    pBLEServer = BLEDevice::createServer();
+    if (!pBLEServer) {
+        Serial.println("BLE: createServer failed (low memory?)");
+        return;
+    }
+    pBLEServer->setCallbacks(new RoseBoxBLEServerCallbacks());
+
+    BLEService* pSvc = pBLEServer->createService(BLE_SERVICE_UUID);
+    if (!pSvc) {
+        Serial.println("BLE: createService failed");
+        return;
+    }
+    pBLETxChar = pSvc->createCharacteristic(BLE_CHAR_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
+    if (!pBLETxChar) {
+        Serial.println("BLE: createCharacteristic TX failed");
+        return;
+    }
+    pBLETxChar->addDescriptor(new BLE2902());
+    BLECharacteristic* pRx = pSvc->createCharacteristic(BLE_CHAR_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
+    if (pRx) pRx->setCallbacks(new RoseBoxBLERxCallbacks());
+    pSvc->start();
+
+    BLEAdvertising* pAdv = BLEDevice::getAdvertising();
+    if (pAdv) {
+        pAdv->addServiceUUID(BLE_SERVICE_UUID);
+        pAdv->setScanResponse(true);
+        pAdv->setMinPreferred(0x06);
+        pAdv->setMaxPreferred(0x12);
+    }
+    BLEDevice::startAdvertising();
+    Serial.println("BLE: Ready, advertising as 'RoseBox'");
+}
+
+static void bleSend(String msg) {
+    if (bleDeviceConnected && pBLETxChar != nullptr) {
+        pBLETxChar->setValue(msg.c_str());
+        pBLETxChar->notify();
+        Serial.println("BLE TX: " + msg);
+    }
+}
+
+static void processBLECommand(String cmd) {
+    cmd.trim();
+    if (cmd.startsWith("CMD:WIFI:SSID:")) {
+        wifiStoredSSID = cmd.substring(14);
+        saveWiFiConfig();
+        bleSend("OK:SSID saved");
+    } else if (cmd.startsWith("CMD:WIFI:PASS:")) {
+        wifiStoredPass = cmd.substring(14);
+        saveWiFiConfig();
+        bleSend("OK:Password saved");
+    } else if (cmd == "CMD:WIFI:CONNECT") {
+        bleSend("OK:Connecting...");
+        if (wifiStoredSSID.length() > 0) {
+            WiFi.begin(wifiStoredSSID.c_str(), wifiStoredPass.c_str());
+        }
+        bleSend("OK:Connect requested");
+    } else if (cmd == "CMD:WIFI:STATUS") {
+        String s = (WiFi.status() == WL_CONNECTED) ? "Connected to " + WiFi.localIP().toString() : "Not connected";
+        bleSend("STATUS:" + s);
+    } else if (cmd == "CMD:SYSTEM:INFO") {
+        String info = "INFO:RoseBox v1.0|SD:" + String(sdReady ? "Yes" : "No");
+        info += "|WiFi:" + String(WiFi.status() == WL_CONNECTED ? "Yes" : "No");
+        info += "|BLE:Yes";
+        bleSend(info);
+    } else if (cmd == "CMD:DISPLAY:PARTIAL:ON") {
+        partialRefreshEnabled = true;
+        saveDisplaySettings();
+        bleSend("OK:Partial ON");
+    } else if (cmd == "CMD:DISPLAY:PARTIAL:OFF") {
+        partialRefreshEnabled = false;
+        saveDisplaySettings();
+        bleSend("OK:Partial OFF");
+    } else if (cmd == "CMD:DISPLAY:INVERT:ON") {
+        displayInverted = true;
+        saveDisplaySettings();
+        bleSend("OK:Invert ON");
+    } else if (cmd == "CMD:DISPLAY:INVERT:OFF") {
+        displayInverted = false;
+        saveDisplaySettings();
+        bleSend("OK:Invert OFF");
+    } else if (cmd == "CMD:DISPLAY:STATUS") {
+        String s = "DISPLAY:Invert=" + String(displayInverted ? "ON" : "OFF");
+        s += "|Partial=" + String(partialRefreshEnabled ? "ON" : "OFF");
+        bleSend(s);
+    } else {
+        bleSend("ERROR:Unknown command");
+    }
+}
+
+static void handleBLEConnection() {
+    if (!pBLEServer) return;
+    yield();
+    delay(1);
+    if (!bleDeviceConnected && bleOldDeviceConnected) {
+        delay(100);
+        pBLEServer->startAdvertising();
+        Serial.println("BLE: Restarted advertising");
+        bleOldDeviceConnected = bleDeviceConnected;
+    }
+    if (bleDeviceConnected && !bleOldDeviceConnected) {
+        bleOldDeviceConnected = bleDeviceConnected;
+    }
+}
 
 #define LUA_DRAW_REF_NONE (-2)
 static int drawCallbackRef = LUA_DRAW_REF_NONE;
@@ -176,7 +398,9 @@ static int l_screen_update(lua_State *L) {
         // Callback-modus: firstPage/nextPage tegner og refresher (én gang)
         display.firstPage();
         do {
+            yield();
             display.fillScreen(EPD_BG());
+            display.setTextColor(EPD_FG());
             lua_rawgeti(L, LUA_REGISTRYINDEX, drawCallbackRef);
             if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
                 Serial.println(lua_tostring(L, -1));
@@ -196,6 +420,7 @@ static int l_screen_drawHome(lua_State *L) {
     display.setFullWindow();
     display.firstPage();
     do {
+        yield();
         display.fillScreen(EPD_BG());
         display.drawBitmap(0, 0, epd_bitmap_home_menu, 250, 122, EPD_FG());
     } while (display.nextPage());
@@ -237,8 +462,10 @@ static int l_screen_drawHomeWithMenu(lua_State *L) {
     applyDisplayWindow(true);
     display.firstPage();
     do {
+        yield();
         display.fillScreen(EPD_BG());
         display.drawBitmap(0, 0, epd_bitmap_home_menu, 250, 122, EPD_FG());
+        drawBatteryIcon(250 - 25, 5);
         display.setTextSize(1);
         display.setTextColor(EPD_FG());
 
@@ -492,6 +719,20 @@ static void saveDisplaySettings() {
     preferences.end();
 }
 
+static void loadWiFiConfig() {
+    preferences.begin("RoseBox", true);
+    wifiStoredSSID = preferences.getString("wifi_ssid", "");
+    wifiStoredPass = preferences.getString("wifi_pass", "");
+    preferences.end();
+}
+
+static void saveWiFiConfig() {
+    preferences.begin("RoseBox", false);
+    preferences.putString("wifi_ssid", wifiStoredSSID);
+    preferences.putString("wifi_pass", wifiStoredPass);
+    preferences.end();
+}
+
 static int l_display_get_inverted(lua_State *L) {
     lua_pushboolean(L, displayInverted ? 1 : 0);
     return 1;
@@ -632,34 +873,108 @@ static int l_keyboard_getKey(lua_State *L) {
     return 1;
 }
 
+// Laster og kjører bootstrap_core.lua fra C (mindre Lua-stack enn require fra Lua). Setter _G._core = retur-tabell.
+static int l_load_app_core(lua_State *L) {
+    File f;
+    if (littlefsReady) f = LittleFS.open("/bootstrap_core.lua", "r");
+    if (!f && spiffsReady) f = SPIFFS.open("/bootstrap_core.lua", "r");
+    if (!f || f.size() == 0 || (size_t)f.size() >= LUA_LOADER_BUF_SIZE) {
+        if (f) f.close();
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    size_t n = f.read((uint8_t*)lua_loader_buf, LUA_LOADER_BUF_SIZE - 1);
+    f.close();
+    if (n == 0) { lua_pushboolean(L, 0); return 1; }
+    lua_loader_buf[n] = '\0';
+    if (luaL_loadbuffer(L, lua_loader_buf, n, "@bootstrap_core.lua") != LUA_OK) {
+        lua_pop(L, 1);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+        lua_pop(L, 1);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    lua_setglobal(L, "_core");
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 // --- Custom Lua Loader (Searcher) ---
 // This allows 'require' to work with LittleFS and SD card
+// Sett til 1 for loader-debug, 1 for heap-tall ved hver require (Serial)
+#define LUA_LOADER_DEBUG 0
+#define LUA_HEAP_DEBUG 1
+
+#define LUA_LOADER_BUF_SIZE 4096
+static char lua_loader_buf[LUA_LOADER_BUF_SIZE];
+
 static int l_vfs_loader(lua_State *L) {
     const char* name = luaL_checkstring(L, 1);
     char path[64];
     
-    // Convert '.' to '/' for Lua module paths
+    // Frigjør Lua-garbage før vi laster (config brukte minne – gi heap til neste modul)
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    
+    // Convert '.' to '/' for Lua module paths (e.g. hal.screen -> hal/screen)
     String modulePath = String(name);
     modulePath.replace(".", "/");
     
-    // Try Flash (LittleFS) first
-    snprintf(path, sizeof(path), "/%s.lua", modulePath.c_str());
-    if (LittleFS.exists(path)) {
-        File f = LittleFS.open(path, "r");
-        String content = f.readString();
-        f.close();
-        if (luaL_loadstring(L, content.c_str()) == LUA_OK) return 1;
-    }
+#if LUA_LOADER_DEBUG
+    Serial.printf("[Loader] require('%s') -> path base '%s'\n", name, modulePath.c_str());
+    Serial.printf("[Loader] littlefsReady=%d heap=%u\n", (int)littlefsReady, (unsigned)ESP.getFreeHeap());
+#endif
+#if defined(LUA_HEAP_DEBUG) && LUA_HEAP_DEBUG
+    Serial.printf("[Heap] require('%s'): %u bytes ledig\n", name, (unsigned)ESP.getFreeHeap());
+#endif
     
-    // Try SD Card (bare hvis SD ble initialisert)
-    if (sdReady) {
-        snprintf(path, sizeof(path), "/%s.lua", modulePath.c_str());
-        if (SD.exists(path)) {
-            File f = SD.open(path, "r");
+    auto tryLoad = [L](FS& fs, const char* p) -> bool {
+        File f = fs.open(p, "r");
+#if LUA_LOADER_DEBUG
+        Serial.printf("[Loader] open('%s') = %s, size = %d\n", p, f ? "OK" : "FAIL", f ? (int)f.size() : 0);
+#endif
+        if (!f || f.size() == 0) return false;
+        size_t sz = (size_t)f.size();
+        int loadOk = LUA_ERRERR;
+        if (sz < LUA_LOADER_BUF_SIZE) {
+            size_t n = f.read((uint8_t*)lua_loader_buf, sz);
+            f.close();
+            if (n > 0) {
+                lua_loader_buf[n] = '\0';
+                loadOk = luaL_loadbuffer(L, lua_loader_buf, n, p);
+            }
+        } else {
             String content = f.readString();
             f.close();
-            if (luaL_loadstring(L, content.c_str()) == LUA_OK) return 1;
+            loadOk = luaL_loadstring(L, content.c_str());
         }
+#if LUA_LOADER_DEBUG
+        if (loadOk != LUA_OK) Serial.printf("[Loader] load failed: %s\n", lua_tostring(L, -1));
+#endif
+        if (loadOk == LUA_OK) return true;
+        lua_pop(L, 1);
+        return false;
+    };
+    
+    // Try LittleFS: /hal/screen.lua (åpne direkte – unngår exists() som noen ganger feiler på underkataloger)
+    if (littlefsReady) {
+        snprintf(path, sizeof(path), "/%s.lua", modulePath.c_str());
+        if (tryLoad(LittleFS, path)) return 1;
+        snprintf(path, sizeof(path), "%s.lua", modulePath.c_str());
+        if (tryLoad(LittleFS, path)) return 1;
+    }
+    if (spiffsReady) {
+        snprintf(path, sizeof(path), "/%s.lua", modulePath.c_str());
+        if (tryLoad(SPIFFS, path)) return 1;
+        snprintf(path, sizeof(path), "%s.lua", modulePath.c_str());
+        if (tryLoad(SPIFFS, path)) return 1;
+    }
+    if (sdReady) {
+        snprintf(path, sizeof(path), "/%s.lua", modulePath.c_str());
+        if (tryLoad(SD, path)) return 1;
     }
 
     lua_pushfstring(L, "\n\tno file '%s' on Flash or SD", name);
@@ -732,6 +1047,9 @@ void register_hal() {
 
     // Keyboard Binding
     lua_pushcfunction(L, l_keyboard_getKey); lua_setfield(L, -2, "keyboard_getKey");
+
+    // Laster bootstrap_core.lua fra C (unngår dybde/krasj ved require fra Lua)
+    lua_pushcfunction(L, l_load_app_core); lua_setfield(L, -2, "load_app_core");
     
     lua_setglobal(L, "HAL");
 
@@ -754,9 +1072,25 @@ void setup() {
   delay(500);
   Serial.println("\n--- RoseBox Boot ---");
 
-  if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS Fail");
-    return;
+  // Start WiFi-driver tidlig (unngår "create wifi task: failed to create queue" ved senere WiFi.begin fra BLE)
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+
+  // false = aldri formatér – ellers kan opplastede filer (Sketch Data Upload) slettes ved mount-feil
+  littlefsReady = LittleFS.begin(false);
+  if (littlefsReady) {
+    Serial.println("LittleFS: mounted");
+    Serial.println("  /bootstrap.lua: " + String(LittleFS.exists("/bootstrap.lua") ? "finnes" : "MANGLER"));
+    Serial.println("  /main.lua: " + String(LittleFS.exists("/main.lua") ? "finnes" : "MANGLER"));
+    Serial.println("  /config.lua: " + String(LittleFS.exists("/config.lua") ? "finnes" : "MANGLER"));
+    Serial.println("  /hal/screen.lua: " + String(LittleFS.exists("/hal/screen.lua") ? "finnes" : "MANGLER"));
+  } else {
+    Serial.println("LittleFS: mount failed (velg samme Partition Scheme som ved LittleFS-opplasting, f.eks. Huge APP)");
+  }
+  spiffsReady = SPIFFS.begin(false);
+  if (spiffsReady) Serial.println("SPIFFS mounted");
+  if (littlefsReady && writeEmbeddedLuaIfMissing()) {
+    Serial.println("LittleFS: wrote default Lua scripts (first boot)");
   }
 
   sdReady = SD.begin(SD_CS);
@@ -768,6 +1102,9 @@ void setup() {
   display.init(115200, true, 2, false);
   display.setRotation(1);
   loadDisplaySettings();
+  loadWiFiConfig();
+  initBLE();  // må startes tidlig – ESP32 BLE-biblioteket krasjer (StoreProhibited) hvis det kalles etter Lua
+  pinMode(39, INPUT);  // Knapp (LilyGo T5) – må settes her så bootstrap får tastetrykk uten Lua GPIO:setup()
   display.setTextColor(EPD_FG());
 
   const int screenW = display.width();
@@ -796,9 +1133,9 @@ void setup() {
   };
 
   // Init Lua i små steg mens vi animerer, så animasjonen går til alt er klart
-  String mainScript;
   int initStep = 0;
   const int totalFrames = 18;  // lengre animasjon før main.lua kjører
+  bool mainExists = false;
 
   for (int frame = 0; frame < totalFrames; frame++) {
     int numDots = (frame % 3) + 1;  // *, **, ***, *, **, ***
@@ -809,7 +1146,10 @@ void setup() {
       display.setPartialWindow(0, 0, screenW, screenH);
     }
     display.firstPage();
-    do { drawBootScreen(numDots); } while (display.nextPage());
+    do {
+        yield();
+        drawBootScreen(numDots);
+    } while (display.nextPage());
     // nextPage() gjør refresh – ingen ekstra display() nødvendig
 
     if (initStep == 0) {
@@ -822,31 +1162,70 @@ void setup() {
       register_hal();
       initStep = 3;
     } else if (initStep == 3) {
-      luaL_dostring(L, "package.path = '/flash/?.lua;/flash/hal/?.lua;/sd/apps/?.lua;/sd/?.lua'");
+      luaL_dostring(L, "package.path = '/?.lua;/hal/?.lua;/sd/apps/?.lua;/sd/?.lua'");
       initStep = 4;
     } else if (initStep == 4) {
-      if (LittleFS.exists("/main.lua")) {
-        File f = LittleFS.open("/main.lua", "r");
-        mainScript = f.readString();
-        f.close();
-      }
+      mainExists = (littlefsReady && (LittleFS.exists("/bootstrap.lua") || LittleFS.exists("/main.lua")))
+                   || (spiffsReady && (SPIFFS.exists("/bootstrap.lua") || SPIFFS.exists("/main.lua")));
       initStep = 5;
     }
 
     delay(bootDotDelayMs);
   }
 
-  // Kjør main.lua (Launcher:start() tegner hjem-skjermen)
-  if (!mainScript.isEmpty() && L != nullptr) {
-    if (luaL_dostring(L, mainScript.c_str()) == LUA_OK) {
+  // Minimal boot: last og kjør bootstrap manuelt slik at vi kan kjøre GC mellom lasting og kjøring (sparer RAM).
+  if (L != nullptr && mainExists) {
+#if defined(LUA_HEAP_DEBUG) && LUA_HEAP_DEBUG
+    Serial.printf("[Heap] før bootstrap: %u bytes ledig\n", (unsigned)ESP.getFreeHeap());
+#endif
+    bool bootstrapOk = false;
+    File f;
+    if (littlefsReady) f = LittleFS.open("/bootstrap.lua", "r");
+    if (!f && spiffsReady) f = SPIFFS.open("/bootstrap.lua", "r");
+    if (f && f.size() > 0 && (size_t)f.size() < LUA_LOADER_BUF_SIZE) {
+      size_t n = f.read((uint8_t*)lua_loader_buf, LUA_LOADER_BUF_SIZE - 1);
+      f.close();
+      if (n > 0) {
+        lua_loader_buf[n] = '\0';
+        if (luaL_loadbuffer(L, lua_loader_buf, n, "@bootstrap.lua") == LUA_OK) {
+          lua_gc(L, LUA_GCCOLLECT, 0);  // frigjør minne fra loadbuffer før vi kjører chunken
+#if defined(LUA_HEAP_DEBUG) && LUA_HEAP_DEBUG
+          Serial.printf("[Heap] etter load, før run: %u bytes ledig\n", (unsigned)ESP.getFreeHeap());
+#endif
+          if (lua_pcall(L, 0, 0, 0) == LUA_OK) {
+            bootstrapOk = true;
+          }
+        }
+        if (!bootstrapOk && lua_gettop(L) > 0) lua_pop(L, 1);
+      }
+    }
+    if (!bootstrapOk) {
+      lua_gc(L, LUA_GCCOLLECT, 0);
+      lua_getglobal(L, "require");
+      lua_pushstring(L, "bootstrap");
+      if (lua_pcall(L, 1, 0, 0) == LUA_OK) {
+        bootstrapOk = true;
+      } else {
+        Serial.print("Bootstrap failed: ");
+        Serial.println(lua_tostring(L, -1));
+        lua_pop(L, 1);
+      }
+    }
+    if (bootstrapOk) {
       luaReady = true;
     } else {
-      Serial.print("Lua Error: ");
-      Serial.println(lua_tostring(L, -1));
-      lua_pop(L, 1);
+      lua_getglobal(L, "require");
+      lua_pushstring(L, "main");
+      if (lua_pcall(L, 1, 0, 0) == LUA_OK) {
+        luaReady = true;
+      } else {
+        Serial.print("Lua Error (main): ");
+        Serial.println(lua_tostring(L, -1));
+        lua_pop(L, 1);
+      }
     }
-  } else if (L != nullptr && mainScript.isEmpty()) {
-    Serial.println("main.lua not found on LittleFS");
+  } else if (L != nullptr && !mainExists) {
+    Serial.println("bootstrap.lua / main.lua not found on LittleFS");
   }
 }
 
@@ -855,6 +1234,7 @@ void loop() {
     delay(100);
     return;
   }
+  handleBLEConnection();
   lua_getglobal(L, "loop");
   if (lua_isfunction(L, -1)) {
     if (lua_pcall(L, 0, 0, 0) != LUA_OK) {

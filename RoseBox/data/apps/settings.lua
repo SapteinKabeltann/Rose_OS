@@ -1,7 +1,17 @@
 -- RoseBox Settings: Invertering, Refresh count, Partial refresh. Kort = neste, Lang = endre, Lang >5s = lagre og hjem.
 local Screen = require("hal.screen")
 local Keyboard = require("hal.keyboard")
-local WiFi = require("hal.wifi")
+-- WiFi lazy: lastes ved første bruk, ensureWiFi() kobler til
+local _wifi = nil
+local function getWiFi()
+    if _wifi == false then return nil end
+    if _wifi then return _wifi end
+    ensureWiFi()
+    local ok, w = pcall(require, "hal.wifi")
+    if not ok or not w then _wifi = false; return nil end
+    _wifi = w
+    return _wifi
+end
 
 local Settings = {}
 local LINE_H = 12
@@ -26,6 +36,8 @@ function Settings:_scrollOffset()
 end
 
 function Settings:_drawContent()
+    -- Forgrunn = false, bakgrunn (hvit på valgt rad) = true. I Lua er 0 truthy, derfor bruk false/true.
+    HAL.screen_setTextColor(false)
     local off = self:_scrollOffset()
     local y = 6
     local inv = HAL.display_get_inverted() and 1 or 0
@@ -41,13 +53,16 @@ function Settings:_drawContent()
     y = y + LINE_H + 4
     HAL.screen_drawLine(0, y - off, HAL.screen_getWidth(), y - off)
     y = y + 6
-    local ip = WiFi:getIP()
+    HAL.screen_setTextColor(false)
+    local w = getWiFi()
+    local ip = (w and w:getIP()) or ""
     Screen:drawText(5, y - off, "IP: " .. (ip ~= "" and ip or "(ikke koblet)"))
     y = y + LINE_H + 6
     HAL.screen_drawLine(0, y - off, HAL.screen_getWidth(), y - off)
     y = y + 6
     self:_drawRow(y - off, ">>> Lagre og lukk <<<", selectedIndex == 3)
     y = y + LINE_H + 4
+    HAL.screen_setTextColor(false)
     Screen:drawText(5, y - off, "Lang >5s=lagre+hjem")
 end
 
@@ -59,10 +74,11 @@ end
 function Settings:_drawRow(y, text, selected)
     if selected then
         HAL.screen_fillRect(0, y - 2, HAL.screen_getWidth(), LINE_H + 2)
-        HAL.screen_setTextColor(1)
+        HAL.screen_setTextColor(true)   -- hvit tekst på valgt rad
         HAL.screen_drawText(5, y, text)
-        HAL.screen_setTextColor(0)
+        HAL.screen_setTextColor(false)  -- tilbake til forgrunn
     else
+        HAL.screen_setTextColor(false)
         HAL.screen_drawText(5, y, text)
     end
 end

@@ -19,12 +19,11 @@ end
 
 function Clock:loop()
     local key = Keyboard:getKey()
-    if key == "LONG_ENTER" then
+    if not key then return end
+    if key == "LONG_ENTER_5SEC" or key == "LONG_ENTER" then
         return "exit"
     end
-    if key then
-        self:redraw()
-    end
+    self:redraw()
 end
 
 return Clock
