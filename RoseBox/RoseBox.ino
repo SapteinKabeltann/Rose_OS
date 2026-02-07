@@ -873,44 +873,74 @@ static int l_keyboard_getKey(lua_State *L) {
     return 1;
 }
 
-// Laster og kjører bootstrap_core.lua fra C (mindre Lua-stack enn require fra Lua). Setter _G._core = retur-tabell.
-static int l_load_app_core(lua_State *L) {
+#define LUA_LOADER_BUF_SIZE 4096
+static char lua_loader_buf[LUA_LOADER_BUF_SIZE];
+
+// Laster og kjører launcher.lua (eller forhåndskompilert launcher.luac) fra C.
+// .luac bruker mye mindre minne under lasting enn kompilering av kildekode.
+static int l_load_launcher(lua_State *L) {
+    static bool load_launcher_logged = false;  // Kun én feilmelding for å unngå spam
     File f;
-    if (littlefsReady) f = LittleFS.open("/bootstrap_core.lua", "r");
-    if (!f && spiffsReady) f = SPIFFS.open("/bootstrap_core.lua", "r");
+    const char *path = nullptr;
+    bool is_bytecode = false;
+    if (littlefsReady) {
+        if (LittleFS.exists("/launcher.luac")) { f = LittleFS.open("/launcher.luac", "r"); path = "@launcher.luac"; is_bytecode = true; }
+        if (!f) { f = LittleFS.open("/launcher.lua", "r"); path = "@launcher.lua"; }
+    }
+    if (!f && spiffsReady) {
+        if (SPIFFS.exists("/launcher.luac")) { f = SPIFFS.open("/launcher.luac", "r"); path = "@launcher.luac"; is_bytecode = true; }
+        if (!f) { f = SPIFFS.open("/launcher.lua", "r"); path = "@launcher.lua"; }
+    }
     if (!f || f.size() == 0 || (size_t)f.size() >= LUA_LOADER_BUF_SIZE) {
         if (f) f.close();
+        if (!load_launcher_logged) {
+            load_launcher_logged = true;
+            Serial.println("load_launcher: /launcher.lua (eller .luac) mangler/for stor - kjør Sketch Data Upload eller luac -o launcher.luac launcher.lua");
+        }
         lua_pushboolean(L, 0);
         return 1;
     }
     size_t n = f.read((uint8_t*)lua_loader_buf, LUA_LOADER_BUF_SIZE - 1);
     f.close();
-    if (n == 0) { lua_pushboolean(L, 0); return 1; }
-    lua_loader_buf[n] = '\0';
-    if (luaL_loadbuffer(L, lua_loader_buf, n, "@bootstrap_core.lua") != LUA_OK) {
+    if (n == 0) {
+        if (!load_launcher_logged) {
+            load_launcher_logged = true;
+            Serial.println("load_launcher: kunne ikke lese fil");
+        }
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    if (!is_bytecode) lua_loader_buf[n] = '\0';
+    lua_gc(L, LUA_GCCOLLECT, 0);  // Frigjør mest mulig før kompilering (reduserer "not enough memory")
+    if (luaL_loadbuffer(L, lua_loader_buf, n, path) != LUA_OK) {
+        if (!load_launcher_logged) {
+            load_launcher_logged = true;
+            Serial.print("load_launcher: loadbuffer feilet: ");
+            Serial.println(lua_tostring(L, -1));
+        }
         lua_pop(L, 1);
         lua_pushboolean(L, 0);
         return 1;
     }
     lua_gc(L, LUA_GCCOLLECT, 0);
     if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+        if (!load_launcher_logged) {
+            load_launcher_logged = true;
+            Serial.print("load_launcher: pcall feilet: ");
+            Serial.println(lua_tostring(L, -1));
+        }
         lua_pop(L, 1);
         lua_pushboolean(L, 0);
         return 1;
     }
-    lua_setglobal(L, "_core");
+    lua_setglobal(L, "launcher");
     lua_pushboolean(L, 1);
     return 1;
 }
 
 // --- Custom Lua Loader (Searcher) ---
-// This allows 'require' to work with LittleFS and SD card
-// Sett til 1 for loader-debug, 1 for heap-tall ved hver require (Serial)
 #define LUA_LOADER_DEBUG 0
 #define LUA_HEAP_DEBUG 1
-
-#define LUA_LOADER_BUF_SIZE 4096
-static char lua_loader_buf[LUA_LOADER_BUF_SIZE];
 
 static int l_vfs_loader(lua_State *L) {
     const char* name = luaL_checkstring(L, 1);
@@ -1048,8 +1078,8 @@ void register_hal() {
     // Keyboard Binding
     lua_pushcfunction(L, l_keyboard_getKey); lua_setfield(L, -2, "keyboard_getKey");
 
-    // Laster bootstrap_core.lua fra C (unngår dybde/krasj ved require fra Lua)
-    lua_pushcfunction(L, l_load_app_core); lua_setfield(L, -2, "load_app_core");
+    // Laster launcher.lua fra C (modulær: core + launcher, unngår stack/krasj ved require fra Lua)
+    lua_pushcfunction(L, l_load_launcher); lua_setfield(L, -2, "load_launcher");
     
     lua_setglobal(L, "HAL");
 
@@ -1080,6 +1110,7 @@ void setup() {
   littlefsReady = LittleFS.begin(false);
   if (littlefsReady) {
     Serial.println("LittleFS: mounted");
+    Serial.println("  /core.lua: " + String(LittleFS.exists("/core.lua") ? "finnes" : "MANGLER"));
     Serial.println("  /bootstrap.lua: " + String(LittleFS.exists("/bootstrap.lua") ? "finnes" : "MANGLER"));
     Serial.println("  /main.lua: " + String(LittleFS.exists("/main.lua") ? "finnes" : "MANGLER"));
     Serial.println("  /config.lua: " + String(LittleFS.exists("/config.lua") ? "finnes" : "MANGLER"));
@@ -1104,7 +1135,7 @@ void setup() {
   loadDisplaySettings();
   loadWiFiConfig();
   initBLE();  // må startes tidlig – ESP32 BLE-biblioteket krasjer (StoreProhibited) hvis det kalles etter Lua
-  pinMode(39, INPUT);  // Knapp (LilyGo T5) – må settes her så bootstrap får tastetrykk uten Lua GPIO:setup()
+  pinMode(39, INPUT);  // Knapp (LilyGo T5) – må settes her så core/launcher får tastetrykk uten Lua GPIO:setup()
   display.setTextColor(EPD_FG());
 
   const int screenW = display.width();
@@ -1165,67 +1196,70 @@ void setup() {
       luaL_dostring(L, "package.path = '/?.lua;/hal/?.lua;/sd/apps/?.lua;/sd/?.lua'");
       initStep = 4;
     } else if (initStep == 4) {
-      mainExists = (littlefsReady && (LittleFS.exists("/bootstrap.lua") || LittleFS.exists("/main.lua")))
-                   || (spiffsReady && (SPIFFS.exists("/bootstrap.lua") || SPIFFS.exists("/main.lua")));
+      mainExists = (littlefsReady && (LittleFS.exists("/core.lua") || LittleFS.exists("/bootstrap.lua") || LittleFS.exists("/main.lua")))
+                   || (spiffsReady && (SPIFFS.exists("/core.lua") || SPIFFS.exists("/bootstrap.lua") || SPIFFS.exists("/main.lua")));
       initStep = 5;
     }
 
     delay(bootDotDelayMs);
   }
 
-  // Minimal boot: last og kjør bootstrap manuelt slik at vi kan kjøre GC mellom lasting og kjøring (sparer RAM).
+  // Modulær boot: last core.lua (minimal kjerne), deretter laster core launcher via HAL.load_launcher() i første loop().
   if (L != nullptr && mainExists) {
 #if defined(LUA_HEAP_DEBUG) && LUA_HEAP_DEBUG
-    Serial.printf("[Heap] før bootstrap: %u bytes ledig\n", (unsigned)ESP.getFreeHeap());
+    Serial.printf("[Heap] før core: %u bytes ledig\n", (unsigned)ESP.getFreeHeap());
 #endif
-    bool bootstrapOk = false;
+    bool coreOk = false;
     File f;
-    if (littlefsReady) f = LittleFS.open("/bootstrap.lua", "r");
-    if (!f && spiffsReady) f = SPIFFS.open("/bootstrap.lua", "r");
+    if (littlefsReady) f = LittleFS.open("/core.lua", "r");
+    if (!f && spiffsReady) f = SPIFFS.open("/core.lua", "r");
     if (f && f.size() > 0 && (size_t)f.size() < LUA_LOADER_BUF_SIZE) {
       size_t n = f.read((uint8_t*)lua_loader_buf, LUA_LOADER_BUF_SIZE - 1);
       f.close();
       if (n > 0) {
         lua_loader_buf[n] = '\0';
-        if (luaL_loadbuffer(L, lua_loader_buf, n, "@bootstrap.lua") == LUA_OK) {
-          lua_gc(L, LUA_GCCOLLECT, 0);  // frigjør minne fra loadbuffer før vi kjører chunken
+        if (luaL_loadbuffer(L, lua_loader_buf, n, "@core.lua") == LUA_OK) {
+          lua_gc(L, LUA_GCCOLLECT, 0);
 #if defined(LUA_HEAP_DEBUG) && LUA_HEAP_DEBUG
-          Serial.printf("[Heap] etter load, før run: %u bytes ledig\n", (unsigned)ESP.getFreeHeap());
+          Serial.printf("[Heap] etter core load, før run: %u bytes ledig\n", (unsigned)ESP.getFreeHeap());
 #endif
           if (lua_pcall(L, 0, 0, 0) == LUA_OK) {
-            bootstrapOk = true;
+            coreOk = true;
           }
         }
-        if (!bootstrapOk && lua_gettop(L) > 0) lua_pop(L, 1);
+        if (!coreOk && lua_gettop(L) > 0) lua_pop(L, 1);
       }
     }
-    if (!bootstrapOk) {
+    if (!coreOk) {
       lua_gc(L, LUA_GCCOLLECT, 0);
-      lua_getglobal(L, "require");
-      lua_pushstring(L, "bootstrap");
-      if (lua_pcall(L, 1, 0, 0) == LUA_OK) {
-        bootstrapOk = true;
-      } else {
-        Serial.print("Bootstrap failed: ");
-        Serial.println(lua_tostring(L, -1));
-        lua_pop(L, 1);
+      if (littlefsReady) f = LittleFS.open("/bootstrap.lua", "r");
+      if (!f && spiffsReady) f = SPIFFS.open("/bootstrap.lua", "r");
+      if (f && f.size() > 0 && (size_t)f.size() < LUA_LOADER_BUF_SIZE) {
+        size_t n = f.read((uint8_t*)lua_loader_buf, LUA_LOADER_BUF_SIZE - 1);
+        f.close();
+        if (n > 0) {
+          lua_loader_buf[n] = '\0';
+          if (luaL_loadbuffer(L, lua_loader_buf, n, "@bootstrap.lua") == LUA_OK) {
+            lua_gc(L, LUA_GCCOLLECT, 0);
+            if (lua_pcall(L, 0, 0, 0) == LUA_OK) coreOk = true;
+          }
+          if (!coreOk && lua_gettop(L) > 0) lua_pop(L, 1);
+        }
+      }
+      if (!coreOk) {
+        lua_getglobal(L, "require");
+        lua_pushstring(L, "main");
+        if (lua_pcall(L, 1, 0, 0) == LUA_OK) coreOk = true;
+        else {
+          Serial.print("Lua Error (main): ");
+          Serial.println(lua_tostring(L, -1));
+          lua_pop(L, 1);
+        }
       }
     }
-    if (bootstrapOk) {
-      luaReady = true;
-    } else {
-      lua_getglobal(L, "require");
-      lua_pushstring(L, "main");
-      if (lua_pcall(L, 1, 0, 0) == LUA_OK) {
-        luaReady = true;
-      } else {
-        Serial.print("Lua Error (main): ");
-        Serial.println(lua_tostring(L, -1));
-        lua_pop(L, 1);
-      }
-    }
+    if (coreOk) luaReady = true;
   } else if (L != nullptr && !mainExists) {
-    Serial.println("bootstrap.lua / main.lua not found on LittleFS");
+    Serial.println("core.lua / bootstrap.lua / main.lua not found on LittleFS");
   }
 }
 

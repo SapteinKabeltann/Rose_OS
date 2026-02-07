@@ -39,58 +39,46 @@ return {
 )EMBED";
     writeIfMissing("/config.lua", c_config);
 
-    static const char c_bootstrap[] PROGMEM = R"EMBED(
+    static const char c_core[] PROGMEM = R"EMBED(
+local load_launcher_failed_logged = false
+function loop()
+  if not _G.launcher then
+    local ok = HAL.load_launcher()
+    if not ok then
+      if not load_launcher_failed_logged then
+        load_launcher_failed_logged = true
+        print("load_launcher failed (se Serial for årsak)")
+      end
+      return
+    end
+  end
+  return _G.launcher.loop()
+end
+)EMBED";
+    writeIfMissing("/core.lua", c_core);
+
+    static const char c_launcher[] PROGMEM = R"EMBED(
 _G.appList = { "terminal", "clock", "settings", "apps" }
 _G.selectedIndex = 1
 _G.currentApp = nil
 _G.currentAppName = nil
-local done = false
+local initialRedrawDone = false
 local function redraw()
   HAL.screen_drawHomeWithMenu(_G.appList, _G.selectedIndex)
 end
-function loop()
-  if _G.currentApp then
-    local c = _G._core
-    if c then
-      local a, b = _G.currentApp:loop()
-      if a == "exit" then c.closeApp(); return end
-      if a == "launch" and b then c.closeApp(); c.launchApp(b); return end
-    end
-    return
-  end
-  if not done then done = true; redraw(); print("Bootstrap: hjem klar") end
-  local key = HAL.keyboard_getKey()
-  if not key then return end
-  if key == "LONG_ENTER" then
-    if not _G._core then
-      local ok = HAL.load_app_core()
-      if not ok then print("load_app_core failed") return end
-    end
-    local n = _G.appList[_G.selectedIndex]
-    if n then _G._core.launchApp(n) end
-  else
-    _G.selectedIndex = (_G.selectedIndex % #_G.appList) + 1
-    redraw()
-  end
-end
-)EMBED";
-    writeIfMissing("/bootstrap.lua", c_bootstrap);
-
-    static const char c_bootstrap_core[] PROGMEM = R"EMBED(
-local function redraw()
-  HAL.screen_drawHomeWithMenu(_G.appList, _G.selectedIndex)
-end
-local function launchApp(name)
+local function launchApp(appName)
   HAL.screen_unregister_draw()
+  package.loaded["apps." .. appName] = nil
+  collectgarbage("collect")
   local mod = nil
-  local ok, err = pcall(function() mod = require("apps." .. name) end)
+  local ok, err = pcall(function() mod = require("apps." .. appName) end)
   if not ok or not mod or not mod.start then
-    print("Kunne ikke starte: " .. tostring(err))
+    print("Kunne ikke starte app: " .. tostring(err))
     redraw()
     return
   end
   _G.currentApp = mod
-  _G.currentAppName = name
+  _G.currentAppName = appName
   mod:start()
 end
 local function closeApp()
@@ -115,9 +103,42 @@ function ensureWiFi()
     w:connect(cfg.wifi_ssid, cfg.wifi_pass or "")
   end
 end
-return { launchApp = launchApp, closeApp = closeApp, ensureWiFi = ensureWiFi }
+local function launcher_loop()
+  if _G.currentApp then
+    local a, b = _G.currentApp:loop()
+    if a == "exit" then closeApp() return end
+    if a == "launch" and b then closeApp() launchApp(b) return end
+    return
+  end
+  if not initialRedrawDone then
+    initialRedrawDone = true
+    redraw()
+    print("Launcher: hjem klar")
+  end
+  local key = HAL.keyboard_getKey()
+  if not key then return end
+  if key == "LONG_ENTER" then
+    local n = _G.appList[_G.selectedIndex]
+    if n then launchApp(n) end
+  else
+    _G.selectedIndex = (_G.selectedIndex % #_G.appList) + 1
+    redraw()
+  end
+end
+return { loop = launcher_loop }
 )EMBED";
-    writeIfMissing("/bootstrap_core.lua", c_bootstrap_core);
+    writeIfMissing("/launcher.lua", c_launcher);
+
+    static const char c_bootstrap[] PROGMEM = R"EMBED(
+function loop()
+  if not _G.launcher then
+    local ok = HAL.load_launcher()
+    if not ok then print("load_launcher failed") return end
+  end
+  return _G.launcher.loop()
+end
+)EMBED";
+    writeIfMissing("/bootstrap.lua", c_bootstrap);
 
     static const char c_main[] PROGMEM = R"EMBED(
 -- RoseBox Main Entry Point
@@ -221,7 +242,7 @@ return Display
 )EMBED";
     writeIfMissing("/hal/display.lua", c_hal_display);
 
-    static const char c_launcher[] PROGMEM = R"EMBED(
+    static const char c_apps_launcher[] PROGMEM = R"EMBED(
 local Screen = require("hal.screen")
 local Keyboard = require("hal.keyboard")
 local Launcher = {}
@@ -259,7 +280,7 @@ function Launcher:loop()
 end
 return Launcher
 )EMBED";
-    writeIfMissing("/apps/launcher.lua", c_launcher);
+    writeIfMissing("/apps/launcher.lua", c_apps_launcher);
 
     static const char c_clock[] PROGMEM = R"EMBED(
 local Screen = require("hal.screen")

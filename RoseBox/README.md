@@ -2,22 +2,27 @@
 
 A lightweight operating system for LilyGo T5 2.13" e-paper display.
 
-## 📁 Folder Structure
+## 📁 Folder Structure (modulær)
 
 ```
-Rose_OS/                 # Project folder
-├── RoseOS/             # Sketch folder
-│   ├── RoseOS.ino      # Main firmware
-│   ├── home.h          # Bitmap data for home screen
-│   ├── icons.h         # Icons
-│   └── web/            # Web interface for WiFi control
-    └── apps/
-        ├── Photo.lua       # Image gallery
-        ├── clock.lua       # Clock app
-        ├── notes.lua       # Notes
-        └── settings.lua    # Settings
-└── sd_card_files/      # Copy contents to SD card
+RoseBox/
+├── RoseBox.ino         # Firmware (mount, display, BLE, Lua-state)
+├── data/
+│   ├── core.lua        # Minimal kjerne – lastes ved boot, laster launcher i første loop()
+│   ├── launcher.lua    # Launcher – app-ikoner, launchApp/closeApp (lastes fra C)
+│   ├── bootstrap.lua   # Fallback hvis core.lua mangler (samme rolle som core)
+│   ├── main.lua        # Full oppstart (fallback)
+│   ├── config.lua
+│   ├── hal/*.lua       # HAL-moduler (screen, keyboard, wifi, …)
+│   └── apps/           # Apper – lastes kun ved start, frigjøres ved avslutning
+│       ├── terminal.lua
+│       ├── clock.lua
+│       ├── settings.lua
+│       └── apps.lua
+└── web/                # Valgfritt WiFi-kontrollpanel
 ```
+
+**RAM:** Kun core + launcher er permanent i RAM. Hver app lastes dynamisk ved åpning og fjernes fra `package.loaded` + `collectgarbage()` ved lukking.
 
 ## 🚀 Installation
 
@@ -39,17 +44,27 @@ Rose_OS/                 # Project folder
 Uten dette får du feilmeldingen **«module 'hal.screen' not found»**.
 
 1. I Arduino IDE: **Tools → ESP32 Sketch Data Upload** (eller **LittleFS Data Upload** / **SPIFFS Data Upload** avhengig av board/plugin).
-2. Dette laster opp mappen **data/** til flash: **bootstrap.lua** (én fil: hjem + åpne/lukke app), **main.lua**, **hal/*.lua**, **apps/*.lua**, **config.lua**.
-3. RoseBox leser fra **både LittleFS og SPIFFS**. Ved **LittleFS Filesystem Upload** (f.eks. earlephilhower som bruker `huge_app`):
-   - **Viktig:** Velg **samme Partition Scheme** når du bygger sketch som når du kjører LittleFS-opplasting. I Arduino IDE: **Tools → Partition Scheme** – velg det som tilsvarer `huge_app` (f.eks. **«Huge APP (3MB No OTA/1MB SPIFFS)»** eller liknende). Bygg og last opp **sketch** med dette valget, deretter **Tools → ESP32 LittleFS Data Upload**.
-   - Ved oppstart skriver RoseBox til Serial om LittleFS er montert og om `/bootstrap.lua`, `/main.lua`, `/config.lua`, `/hal/screen.lua` **finnes** eller **MANGLER**. Ser du «LittleFS: mount failed» eller «MANGLER», bygg sketch på nytt med riktig Partition Scheme og last opp sketch + LittleFS igjen.
-   - Koden bruker `LittleFS.begin(false)` så partisjonen aldri formateres ved oppstart.
+2. Dette laster opp **data/** til flash: **core.lua**, **launcher.lua**, **config.lua**, **hal/*.lua**, **apps/*.lua**. (bootstrap.lua og main.lua brukes som fallback.)
+3. RoseBox leser fra **LittleFS og SPIFFS**. Ved LittleFS-opplasting:
+   - Velg **samme Partition Scheme** for sketch og data (f.eks. Huge APP).
+   - Ved oppstart vises om `/core.lua`, `/launcher.lua`, `/config.lua`, `/hal/screen.lua` **finnes** eller **MANGLER**.
+   - `LittleFS.begin(false)` – partisjonen formateres ikke ved oppstart.
 
-**Minimal boot:** Ved oppstart kjører RoseBox **bootstrap.lua** (én fil med hjem-meny, åpne/lukke app). Ved **Lang trykk** lastes kun den valgte appen (f.eks. `require("apps.terminal")`) – ingen ekstra bootstrap_core. BLE og WiFi (C++) er aktive fra setup(). Hvis bootstrap feiler, faller firmware tilbake til **main.lua**.  
+**Modulær boot:**  
+- **Core** (`core.lua`): lastes først, forblir i RAM. Filystem/skjerm/input/BLE er satt opp i C++ (setup).  
+- **Launcher** (`launcher.lua`): lastes fra C i første `loop()` (HAL.load_launcher), viser app-ikoner, starter app ved Lang trykk. Core + launcher er alltid i RAM.  
+- **Apper**: lastes kun når brukeren åpner dem; ved avslutning fjernes de fra `package.loaded` og `collectgarbage()` kjøres.  
 
-**Hvis du får «not enough memory»:** Det er **RAM (heap)** som er tom. Med splittet bootstrap lastes minimalt ved boot; bootstrap_core og apper lastes on demand. For å se ledig heap: i `RoseBox.ino` sett `LUA_HEAP_DEBUG 1`.
+Fallback: hvis `core.lua` mangler, prøves `bootstrap.lua`, deretter `main.lua`.
 
-**Legge til nye Lua-apper:** Du trenger ikke endre C++ eller bootstrap_core. 1) Lag `data/apps/minapp.lua` som returnerer en tabell med `:start()` og `:loop()` (se f.eks. `clock.lua`). 2) Legg `"minapp"` inn i listen i `data/bootstrap.lua`: `_G.appList = { "terminal", "clock", "settings", "apps", "minapp" }`. 3) Last opp data på nytt. Appen lastes først når brukeren åpner den; når de lukker, frigjøres minnet. Ny app = ingen ekstra minne ved oppstart.
+**Hvis du får «not enough memory» ved lasting av launcher:** Launcher kompileres fra kildekode og bruker mye heap. Løsning: last opp **forhåndskompilert bytecode** i stedet. På PC (samme Lua-versjon som firmware, typisk 5.1 eller 5.2):
+```bash
+luac -o launcher.luac launcher.lua
+```
+Legg **launcher.luac** i **data/** (sammen med launcher.lua eller alene) og kjør **Tools → ESP32 Sketch Data Upload**. Firmware prøver `/launcher.luac` først og bruker da mye mindre minne under lasting.  
+For generell heap-debug: sett `LUA_HEAP_DEBUG 1` i RoseBox.ino for å se ledig heap.
+
+**Legge til nye Lua-apper:** 1) Lag `data/apps/minapp.lua` med `:start()` og `:loop()` (se `clock.lua`). 2) Legg `"minapp"` inn i **`data/launcher.lua`**: `_G.appList = { "terminal", "clock", "settings", "apps", "minapp" }`. 3) Last opp data. Appen lastes kun ved åpning og frigjøres ved lukking.
 
 ### 4. SD-kort (valgfritt)
 
