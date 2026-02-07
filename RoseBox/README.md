@@ -2,27 +2,20 @@
 
 A lightweight operating system for LilyGo T5 2.13" e-paper display.
 
-## 📁 Folder Structure (modulær)
+**Native C++-apper (v1.0.1+):** Alle apper er hardkodet i flash som C++. Hjemskjerm, Terminal, Clock, Settings og Apps kjører uten Lua – minimal heap, ingen `dofile` eller Lua-kompilering. BLE, skjerm, SD og LittleFS initialiseres én gang i `setup()`.
+
+## 📁 Folder Structure
 
 ```
 RoseBox/
-├── RoseBox.ino         # Firmware (mount, display, BLE, Lua-state)
-├── data/
-│   ├── core.lua        # Minimal kjerne – lastes ved boot, laster launcher i første loop()
-│   ├── launcher.lua    # Launcher – app-ikoner, launchApp/closeApp (lastes fra C)
-│   ├── bootstrap.lua   # Fallback hvis core.lua mangler (samme rolle som core)
-│   ├── main.lua        # Full oppstart (fallback)
-│   ├── config.lua
-│   ├── hal/*.lua       # HAL-moduler (screen, keyboard, wifi, …)
-│   └── apps/           # Apper – lastes kun ved start, frigjøres ved avslutning
-│       ├── terminal.lua
-│       ├── clock.lua
-│       ├── settings.lua
-│       └── apps.lua
+├── RoseBox.ino         # Firmware: display, BLE, SD, LittleFS + native app-loop
+├── App.h               # App-struktur (setup/loop/name), launchApp(), apps[]
+├── data/               # Valgfritt: Lua-filer brukes ikke lenger av kjernen
+│   └── apps/           # (SD .lua vises i Apps-app som liste, kjøres ikke)
 └── web/                # Valgfritt WiFi-kontrollpanel
 ```
 
-**RAM:** Kun core + launcher er permanent i RAM. Hver app lastes dynamisk ved åpning og fjernes fra `package.loaded` + `collectgarbage()` ved lukking.
+**Apper (C++):** Home (launcher), Terminal, Clock, Settings, Apps. Bytt med kort trykk på hjemskjerm, lang trykk for å åpne. `launchApp(0)` = tilbake til hjemskjerm.
 
 ## 🚀 Installation
 
@@ -57,12 +50,24 @@ Uten dette får du feilmeldingen **«module 'hal.screen' not found»**.
 
 Fallback: hvis `core.lua` mangler, prøves `bootstrap.lua`, deretter `main.lua`.
 
-**Hvis du får «not enough memory» ved lasting av launcher:** Launcher kompileres fra kildekode og bruker mye heap. Løsning: last opp **forhåndskompilert bytecode** i stedet. På PC (samme Lua-versjon som firmware, typisk 5.1 eller 5.2):
+**Hvis du får «not enough memory» ved lasting av launcher:** Launcher kompileres fra kildekode og bruker mye heap. Løsning: last opp **forhåndskompilert bytecode** i stedet. På PC (samme Lua-versjon som firmware, typisk 5.1):
 ```bash
 luac -o launcher.luac launcher.lua
 ```
-Legg **launcher.luac** i **data/** (sammen med launcher.lua eller alene) og kjør **Tools → ESP32 Sketch Data Upload**. Firmware prøver `/launcher.luac` først og bruker da mye mindre minne under lasting.  
+Legg **launcher.luac** i **data/** og kjør **Tools → ESP32 Sketch Data Upload**. Firmware prøver `.luac` først og bruker da mye mindre minne.  
 For generell heap-debug: sett `LUA_HEAP_DEBUG 1` i RoseBox.ino for å se ledig heap.
+
+### Optimalisering (heap, BLE, .luac) – anbefalt workflow
+
+| Mål | Hvordan |
+|-----|--------|
+| **Mindre heap** | Kompiler Lua til `.luac` (bytecode). `require("modul")` prøver automatisk `.luac` før `.lua`. |
+| **Kompilere alt** | Kjør `scripts\compile_lua.bat` (Windows). Krever Lua 5.1 `luac` i PATH. Last deretter opp **data/** med Sketch Data Upload. |
+| **Store moduler** | Legg store `.luac` på **SD-kort**, små config på **LittleFS**. Last fra Lua: `HAL.dofile("/sd/scripts/stor_modul.luac")`. |
+| **Modulær lasting** | Last kun det som trengs: `local display = require("hal.screen")`. Avlast med `HAL.collect_garbage()` etter store operasjoner. |
+| **BLE stabil** | Firmware bruker allerede små BLE-pakker og prosesserer i hovedloop (ikke i BLE-callback). Unngå tung jobb i BLE-callback fra Lua. |
+| **E-paper** | Partiell oppdatering er på. Unngå store bitmap-tabeller i Lua – bruk C-side eller buffer på SD. |
+| **Debugging** | Logg til SD i stedet for Serial: `HAL.debug_log("melding")` skriver til `/debug.log` (SD eller flash). |
 
 **Legge til nye Lua-apper:** 1) Lag `data/apps/minapp.lua` med `:start()` og `:loop()` (se `clock.lua`). 2) Legg `"minapp"` inn i **`data/launcher.lua`**: `_G.appList = { "terminal", "clock", "settings", "apps", "minapp" }`. 3) Last opp data. Appen lastes kun ved åpning og frigjøres ved lukking.
 

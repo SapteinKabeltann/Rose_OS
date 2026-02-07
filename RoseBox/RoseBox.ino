@@ -1,32 +1,3 @@
-#include <lapi.h>
-#include <lauxlib.h>
-#include <lcode.h>
-#include <ldebug.h>
-#include <ldo.h>
-#include <lfunc.h>
-#include <lgc.h>
-#include <llex.h>
-#include <llimits.h>
-#include <lmem.h>
-#include <lobject.h>
-#include <lopcodes.h>
-#include <lparser.h>
-#include <lstate.h>
-#include <lstring.h>
-#include <ltable.h>
-#include <ltm.h>
-#include <lua.h>
-#include <luaconf.h>
-#include <lualib.h>
-#include <lundump.h>
-#include <lvm.h>
-#include <lzio.h>
-
-/* Lua's io/posix code can define getline macro; undef to avoid conflict with C++ std::getline */
-#ifdef getline
-#undef getline
-#endif
-
 #include <Arduino.h>
 #include <SPI.h>
 #include <SD.h>
@@ -35,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <Preferences.h>
+#include <time.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -42,7 +14,7 @@
 #include <GxEPD2_BW.h>
 #include "icons.h"
 #include "home.h"
-#include "embedded_lua.h"
+#include "App.h"
 
 // Øk stack for loop-task (Lua + display + BLE bruker mye – unngår abort/stack overflow på core 1)
 size_t getArduinoLoopTaskStackSize(void) {
@@ -82,27 +54,24 @@ GxEPD2_BW<GxEPD2_213_BN, GxEPD2_213_BN::HEIGHT> display(
     GxEPD2_213_BN(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
 );
 
-// Core Lua Header
-extern "C" {
-  #include <lua.h>
-  #include <lualib.h>
-  #include <lauxlib.h>
-}
-
 // --- Status ---
-lua_State *L = nullptr;
-bool luaReady = false;
 bool sdReady = false;
 bool littlefsReady = false;
 bool spiffsReady = false;  // Sketch Data Upload bruker ofte SPIFFS-partisjon
 WiFiClient tcpClient;
 
-// WiFi lagret for BLE-kommandoer (CMD:WIFI:SSID/PASS:CONNECT)
+// WiFi lagret for BLE-kommandoer og auto-connect ved oppstart
 static String wifiStoredSSID = "";
 static String wifiStoredPass = "";
+static bool ntpConfigDone = false;  // NTP settes én gang når WiFi er koblet
 
-// BLE: buffer for linjedelte kommandoer (én kommando per linje)
+// BLE-injisert knapp: CMD:BUTTON:SHORT/LONG/LONG:5SEC setter denne; keyboardGetKey() returnerer og clearer
+static String s_bleInjectedKey = "";
+
+// BLE: liten buffer (20–50 byte anbefalt) – unngår StoreProhibited. Prosessering skjer i loop(), ikke i callback.
+#define BLE_RX_BUFFER_MAX 128
 static String bleRxBuffer = "";
+static volatile bool bleDataPending = false;
 
 // Forward for BLE
 static void processBLECommand(String cmd);
@@ -110,28 +79,9 @@ static void initBLE();
 static void bleSend(String msg);
 static void handleBLEConnection();
 
-// --- GPIO Bindings ---
-static int l_gpio_mode(lua_State *L) {
-    int pin = luaL_checkinteger(L, 1);
-    int mode = luaL_checkinteger(L, 2); 
-    pinMode(pin, mode ? OUTPUT : INPUT);
-    return 0;
-}
+// (GPIO brukes direkte: pinMode(39, INPUT), digitalRead(39) i keyboardGetKey)
 
-static int l_gpio_write(lua_State *L) {
-    int pin = luaL_checkinteger(L, 1);
-    int val = luaL_checkinteger(L, 2);
-    digitalWrite(pin, val);
-    return 0;
-}
-
-static int l_gpio_read(lua_State *L) {
-    int pin = luaL_checkinteger(L, 1);
-    lua_pushinteger(L, digitalRead(pin));
-    return 1;
-}
-
-// --- Screen Bindings ---
+// --- Display / skjerm (applyDisplayWindow, getAppIcon) ---
 // Software-inversjon: EPD_FG = forgrunn (normalt svart), EPD_BG = bakgrunn (normalt hvit)
 static inline uint16_t EPD_FG() { return displayInverted ? GxEPD_WHITE : GxEPD_BLACK; }
 static inline uint16_t EPD_BG() { return displayInverted ? GxEPD_BLACK : GxEPD_WHITE; }
@@ -158,6 +108,24 @@ static void drawBatteryIcon(int x, int y) {
     }
 }
 
+// Tid fra NTP (eller "--:--" / "dd.mm --:--" hvis ikke synket ennå)
+static void getTimeString(char* buf, size_t len, bool includeDate) {
+    time_t now;
+    time(&now);
+    struct tm* t = localtime(&now);
+    if (t && now > 0) {
+        if (includeDate)
+            strftime(buf, len, "%d.%m  %H:%M", t);
+        else
+            strftime(buf, len, "%H:%M", t);
+    } else {
+        if (includeDate)
+            snprintf(buf, len, "--.--  --:--");
+        else
+            snprintf(buf, len, "--:--");
+    }
+}
+
 // --- BLE callbacks (unngår GATT 147 ved å ikke kreve pairing) ---
 class RoseBoxBLEServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
@@ -170,49 +138,61 @@ class RoseBoxBLEServerCallbacks : public BLEServerCallbacks {
     }
 };
 
+// Kun append i callback – tung prosessering i loop() for å unngå StoreProhibited.
 class RoseBoxBLERxCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pCharacteristic) override {
         std::string rx = pCharacteristic->getValue();
         if (rx.length() == 0) return;
-        bleRxBuffer += String(rx.c_str());
-        // Prosesser kommandoer: splitt på linjeskift eller på neste "CMD:" (flere kommandoer i én pakke)
-        while (bleRxBuffer.length() > 0) {
-            int idxLn = bleRxBuffer.indexOf('\n');
-            if (idxLn < 0) idxLn = bleRxBuffer.indexOf('\r');
-            int idxCmd = (bleRxBuffer.startsWith("CMD:")) ? bleRxBuffer.indexOf("CMD:", 4) : -1;
-            int idx = -1;
-            bool useLn = (idxLn >= 0 && (idxCmd < 0 || idxLn <= idxCmd));
-            bool useCmd = (idxCmd >= 0 && (idxLn < 0 || idxCmd < idxLn));
-            if (useLn) idx = idxLn;
-            else if (useCmd) idx = idxCmd;
-            if (idx < 0) break;
-            String line = bleRxBuffer.substring(0, idx);
-            if (useLn) {
-                bleRxBuffer = bleRxBuffer.substring(idx + 1);
-                if (bleRxBuffer.length() > 0 && (bleRxBuffer[0] == '\n' || bleRxBuffer[0] == '\r')) bleRxBuffer = bleRxBuffer.substring(1);
-            } else {
-                bleRxBuffer = bleRxBuffer.substring(idx);
-            }
-            line.trim();
-            if (line.length() > 0) {
-                Serial.println("BLE RX: " + line);
-                processBLECommand(line);
-            }
-        }
-        // Enkelt kommando uten linjeskift (f.eks. bare CMD:WIFI:PASS:xxx)
-        bleRxBuffer.trim();
-        if (bleRxBuffer.length() > 0 && bleRxBuffer.startsWith("CMD:")) {
-            Serial.println("BLE RX: " + bleRxBuffer);
-            processBLECommand(bleRxBuffer);
-            bleRxBuffer = "";
-        }
-        if (bleRxBuffer.length() > 512) bleRxBuffer = bleRxBuffer.substring(bleRxBuffer.length() - 256);
+        size_t len = rx.length();
+        if (len > 50) len = 50;  // Små pakker: begrens per mottak
+        bleRxBuffer += String(rx.substr(0, len).c_str());
+        if (bleRxBuffer.length() > BLE_RX_BUFFER_MAX)
+            bleRxBuffer = bleRxBuffer.substring(bleRxBuffer.length() - (BLE_RX_BUFFER_MAX / 2));
+        bleDataPending = true;
     }
 };
 
+// Prosesser BLE-buffer i hovedloop (ikke i callback) – unngår tunge operasjoner i BLE-kontekst.
+static void processBLEFromBuffer() {
+    if (!bleDataPending || bleRxBuffer.length() == 0) return;
+    bleDataPending = false;
+    while (bleRxBuffer.length() > 0) {
+        int idxLn = bleRxBuffer.indexOf('\n');
+        if (idxLn < 0) idxLn = bleRxBuffer.indexOf('\r');
+        int idxCmd = (bleRxBuffer.startsWith("CMD:")) ? bleRxBuffer.indexOf("CMD:", 4) : -1;
+        int idx = -1;
+        bool useLn = (idxLn >= 0 && (idxCmd < 0 || idxLn <= idxCmd));
+        bool useCmd = (idxCmd >= 0 && (idxLn < 0 || idxCmd < idxLn));
+        if (useLn) idx = idxLn;
+        else if (useCmd) idx = idxCmd;
+        if (idx < 0) break;
+        String line = bleRxBuffer.substring(0, idx);
+        if (useLn) {
+            bleRxBuffer = bleRxBuffer.substring(idx + 1);
+            if (bleRxBuffer.length() > 0 && (bleRxBuffer[0] == '\n' || bleRxBuffer[0] == '\r'))
+                bleRxBuffer = bleRxBuffer.substring(1);
+        } else {
+            bleRxBuffer = bleRxBuffer.substring(idx);
+        }
+        line.trim();
+        if (line.length() > 0) {
+            Serial.println("BLE RX: " + line);
+            processBLECommand(line);
+        }
+    }
+    bleRxBuffer.trim();
+    if (bleRxBuffer.length() > 0 && bleRxBuffer.startsWith("CMD:")) {
+        Serial.println("BLE RX: " + bleRxBuffer);
+        processBLECommand(bleRxBuffer);
+        bleRxBuffer = "";
+    }
+    if (bleRxBuffer.length() > BLE_RX_BUFFER_MAX)
+        bleRxBuffer = bleRxBuffer.substring(bleRxBuffer.length() - (BLE_RX_BUFFER_MAX / 2));
+}
+
 static void initBLE() {
     Serial.println("Initializing BLE...");
-    BLEDevice::setMTU(185);
+    BLEDevice::setMTU(64);  // Små pakker (20–50 byte) reduserer BLE-stack og StoreProhibited
     BLEDevice::init("RoseBox");
     pBLEServer = BLEDevice::createServer();
     if (!pBLEServer) {
@@ -299,6 +279,17 @@ static void processBLECommand(String cmd) {
         String s = "DISPLAY:Invert=" + String(displayInverted ? "ON" : "OFF");
         s += "|Partial=" + String(partialRefreshEnabled ? "ON" : "OFF");
         bleSend(s);
+    } else if (cmd == "CMD:BUTTON" || cmd == "CMD:BUTTON:SHORT" || cmd == "CMD:BUTTON:PRESS") {
+        s_bleInjectedKey = "ENTER";
+        bleSend("OK:Button short");
+    } else if (cmd == "CMD:BUTTON:LONG") {
+        s_bleInjectedKey = "LONG_ENTER";
+        bleSend("OK:Button long");
+    } else if (cmd == "CMD:BUTTON:LONG:5SEC" || cmd == "CMD:BUTTON:5SEC" || cmd == "CMD:BUTTON:VERYLONG") {
+        s_bleInjectedKey = "LONG_ENTER_5SEC";
+        bleSend("OK:Button long 5s");
+    } else if (cmd == "CMD:BUTTON:HELP") {
+        bleSend("BUTTON: CMD:BUTTON|SHORT|PRESS=short, CMD:BUTTON:LONG=long, CMD:BUTTON:LONG:5SEC|5SEC|VERYLONG=5s");
     } else {
         bleSend("ERROR:Unknown command");
     }
@@ -317,34 +308,6 @@ static void handleBLEConnection() {
     if (bleDeviceConnected && !bleOldDeviceConnected) {
         bleOldDeviceConnected = bleDeviceConnected;
     }
-}
-
-#define LUA_DRAW_REF_NONE (-2)
-static int drawCallbackRef = LUA_DRAW_REF_NONE;
-
-static int l_screen_init(lua_State *L) {
-    display.init(115200, true, 2, false);
-    display.setRotation(1);
-    display.setTextColor(EPD_FG());
-    return 0;
-}
-
-static int l_screen_register_draw(lua_State *L) {
-    luaL_checktype(L, 1, LUA_TFUNCTION);
-    lua_pushvalue(L, 1);
-    if (drawCallbackRef != LUA_DRAW_REF_NONE) {
-        luaL_unref(L, LUA_REGISTRYINDEX, drawCallbackRef);
-    }
-    drawCallbackRef = luaL_ref(L, LUA_REGISTRYINDEX);
-    return 0;
-}
-
-static int l_screen_unregister_draw(lua_State *L) {
-    if (drawCallbackRef != LUA_DRAW_REF_NONE) {
-        luaL_unref(L, LUA_REGISTRYINDEX, drawCallbackRef);
-        drawCallbackRef = LUA_DRAW_REF_NONE;
-    }
-    return 0;
 }
 
 static void applyDisplayWindow(bool incrementPartialCount) {
@@ -370,64 +333,7 @@ static void applyDisplayWindow(bool incrementPartialCount) {
     }
 }
 
-static int l_screen_clear(lua_State *L) {
-    applyDisplayWindow(true);
-    display.fillScreen(EPD_BG());
-    return 0;
-}
-
-static int l_screen_drawText(lua_State *L) {
-    int x = luaL_checkinteger(L, 1);
-    int y = luaL_checkinteger(L, 2);
-    const char* text = luaL_checkstring(L, 3);
-    
-    display.setCursor(x, y);
-    display.print(text);
-    return 0;
-}
-
-static int l_screen_setTextColor(lua_State *L) {
-    int white = lua_toboolean(L, 1);
-    display.setTextColor(white ? EPD_BG() : EPD_FG());
-    return 0;
-}
-
-static int l_screen_update(lua_State *L) {
-    applyDisplayWindow(false);
-    if (drawCallbackRef != LUA_DRAW_REF_NONE) {
-        // Callback-modus: firstPage/nextPage tegner og refresher (én gang)
-        display.firstPage();
-        do {
-            yield();
-            display.fillScreen(EPD_BG());
-            display.setTextColor(EPD_FG());
-            lua_rawgeti(L, LUA_REGISTRYINDEX, drawCallbackRef);
-            if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-                Serial.println(lua_tostring(L, -1));
-                lua_pop(L, 1);
-            }
-        } while (display.nextPage());
-        // IKKE kall display.display() – nextPage() har allerede refreshet
-    } else {
-        // Direkte-modus: buffer er fylt av clear+draw-kall, send med display()
-        display.display(partialRefreshEnabled);
-    }
-    return 0;
-}
-
-// Home screen / dashboard (home.h – 250x122, full screen på 2.13")
-static int l_screen_drawHome(lua_State *L) {
-    display.setFullWindow();
-    display.firstPage();
-    do {
-        yield();
-        display.fillScreen(EPD_BG());
-        display.drawBitmap(0, 0, epd_bitmap_home_menu, 250, 122, EPD_FG());
-    } while (display.nextPage());
-    return 0;
-}
-
-// Home + app menu: grid med opptil 5 app-celler (containere). Lua: screen_drawHomeWithMenu({ "terminal", "clock", "settings", "apps" }, selectedIndex)
+// Ikoner for app-meny (brukes av native screenDrawHomeWithMenu)
 static const unsigned char* getAppIcon(const char* name) {
     if (strcmp(name, "terminal") == 0) return epd_bitmap_terminal_icon;
     if (strcmp(name, "clock") == 0) return icon_clock;
@@ -436,269 +342,6 @@ static const unsigned char* getAppIcon(const char* name) {
     if (strcmp(name, "apps") == 0) return icon_apps;
     if (strcmp(name, "settings") == 0 || strcmp(name, "setup") == 0) return icon_settings;
     return icon_apps;  // ukjente apper
-}
-
-static int l_screen_drawHomeWithMenu(lua_State *L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    int selected = (int)luaL_checkinteger(L, 2);  // 1-based from Lua
-    const int gridSlots = 5;  // fast antall ruter i gridet
-    const char* names[gridSlots];
-    int n = 0;
-    for (int i = 1; i <= gridSlots; i++) {
-        lua_rawgeti(L, 1, i);
-        if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
-        names[n++] = lua_tostring(L, -1);
-        lua_pop(L, 1);
-    }
-
-    const int iconSize = 32;
-    const int gridCols = 5;
-    const int cellW = 250 / gridCols;   // 50 px per celle
-    const int gridY = 38;
-    const int cellH = 52;
-    const int iconXOffset = (cellW - iconSize) / 2;
-    const int iconYOffset = 4;
-
-    applyDisplayWindow(true);
-    display.firstPage();
-    do {
-        yield();
-        display.fillScreen(EPD_BG());
-        display.drawBitmap(0, 0, epd_bitmap_home_menu, 250, 122, EPD_FG());
-        drawBatteryIcon(250 - 25, 5);
-        display.setTextSize(1);
-        display.setTextColor(EPD_FG());
-
-        for (int i = 0; i < gridSlots; i++) {
-            int cellX = i * cellW;
-            int cellY = gridY;
-            bool selectedCell = (i + 1 == selected);
-
-            if (selectedCell) {
-                display.fillRoundRect(cellX + 1, cellY + 1, cellW - 2, cellH - 2, 3, EPD_FG());
-            } else {
-                display.drawRoundRect(cellX + 1, cellY + 1, cellW - 2, cellH - 2, 3, EPD_FG());
-            }
-
-            if (i < n) {
-                int iconX = cellX + iconXOffset;
-                int iconY = cellY + iconYOffset;
-                const unsigned char* icon = getAppIcon(names[i]);
-                if (selectedCell) {
-                    display.drawBitmap(iconX, iconY, icon, iconSize, iconSize, EPD_BG());
-                } else {
-                    display.drawBitmap(iconX, iconY, icon, iconSize, iconSize, EPD_FG());
-                }
-                int16_t tx1, ty1;
-                uint16_t tw, th;
-                display.getTextBounds(names[i], 0, 0, &tx1, &ty1, &tw, &th);
-                int textX = cellX + (cellW - (int)tw) / 2;
-                int textY = cellY + iconSize + iconYOffset + 2;
-                display.setCursor(textX, textY);
-                if (selectedCell) display.setTextColor(EPD_BG());
-                display.print(names[i]);
-                if (selectedCell) display.setTextColor(EPD_FG());
-            }
-        }
-    } while (display.nextPage());
-    // nextPage() har allerede refreshet – ingen display() nødvendig
-    return 0;
-}
-
-static int l_screen_drawLine(lua_State *L) {
-    int x0 = luaL_checkinteger(L, 1);
-    int y0 = luaL_checkinteger(L, 2);
-    int x1 = luaL_checkinteger(L, 3);
-    int y1 = luaL_checkinteger(L, 4);
-    display.drawLine(x0, y0, x1, y1, EPD_FG());
-    return 0;
-}
-
-static int l_screen_fillCircle(lua_State *L) {
-    int x = luaL_checkinteger(L, 1);
-    int y = luaL_checkinteger(L, 2);
-    int r = luaL_checkinteger(L, 3);
-    display.fillCircle(x, y, r, EPD_FG());
-    return 0;
-}
-
-static int l_screen_drawCircle(lua_State *L) {
-    int x = luaL_checkinteger(L, 1);
-    int y = luaL_checkinteger(L, 2);
-    int r = luaL_checkinteger(L, 3);
-    display.drawCircle(x, y, r, EPD_FG());
-    return 0;
-}
-
-static int l_screen_fillRect(lua_State *L) {
-    int x = luaL_checkinteger(L, 1);
-    int y = luaL_checkinteger(L, 2);
-    int w = luaL_checkinteger(L, 3);
-    int h = luaL_checkinteger(L, 4);
-    display.fillRect(x, y, w, h, EPD_FG());
-    return 0;
-}
-
-static int l_screen_drawRect(lua_State *L) {
-    int x = luaL_checkinteger(L, 1);
-    int y = luaL_checkinteger(L, 2);
-    int w = luaL_checkinteger(L, 3);
-    int h = luaL_checkinteger(L, 4);
-    display.drawRect(x, y, w, h, EPD_FG());
-    return 0;
-}
-
-static int l_screen_fillTriangle(lua_State *L) {
-    int x0 = luaL_checkinteger(L, 1);
-    int y0 = luaL_checkinteger(L, 2);
-    int x1 = luaL_checkinteger(L, 3);
-    int y1 = luaL_checkinteger(L, 4);
-    int x2 = luaL_checkinteger(L, 5);
-    int y2 = luaL_checkinteger(L, 6);
-    display.fillTriangle(x0, y0, x1, y1, x2, y2, EPD_FG());
-    return 0;
-}
-
-static int l_screen_getWidth(lua_State *L) {
-    lua_pushinteger(L, display.width());
-    return 1;
-}
-
-static int l_screen_getHeight(lua_State *L) {
-    lua_pushinteger(L, display.height());
-    return 1;
-}
-
-static int l_screen_setTextSize(lua_State *L) {
-    int s = luaL_checkinteger(L, 1);
-    display.setTextSize(s);
-    return 0;
-}
-
-static int l_screen_getTextWidth(lua_State *L) {
-    const char* text = luaL_checkstring(L, 1);
-    if (lua_gettop(L) >= 2) {
-        int s = luaL_checkinteger(L, 2);
-        display.setTextSize(s);
-    }
-    int16_t x1, y1;
-    uint16_t w, h;
-    display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
-    lua_pushinteger(L, (int)w);
-    return 1;
-}
-
-// --- Delay (for Lua loop / waitForKey) ---
-static int l_delay_ms(lua_State *L) {
-    int ms = luaL_checkinteger(L, 1);
-    if (ms > 0 && ms <= 10000) delay(ms);
-    return 0;
-}
-
-// --- File read/write (LittleFS + SD) ---
-static int l_file_read(lua_State *L) {
-    const char* path = luaL_checkstring(L, 1);
-    if (path[0] == '\0') {
-        lua_pushnil(L);
-        return 1;
-    }
-    String p = (path[0] == '/') ? String(path) : String("/") + path;
-    if (LittleFS.exists(p.c_str())) {
-        File f = LittleFS.open(p.c_str(), "r");
-        if (f) {
-            String content = f.readString();
-            f.close();
-            lua_pushstring(L, content.c_str());
-            return 1;
-        }
-    }
-    if (sdReady && SD.exists(p.c_str())) {
-        File f = SD.open(p.c_str(), "r");
-        if (f) {
-            String content = f.readString();
-            f.close();
-            lua_pushstring(L, content.c_str());
-            return 1;
-        }
-    }
-    lua_pushnil(L);
-    return 1;
-}
-
-static int l_file_write(lua_State *L) {
-    const char* path = luaL_checkstring(L, 1);
-    const char* content = luaL_checkstring(L, 2);
-    if (path[0] == '\0') {
-        lua_pushboolean(L, 0);
-        return 1;
-    }
-    String p = (path[0] == '/') ? String(path) : String("/") + path;
-    File f = LittleFS.open(p.c_str(), "w");
-    if (f) {
-        f.print(content);
-        f.close();
-        lua_pushboolean(L, 1);
-        return 1;
-    }
-    if (sdReady) {
-        f = SD.open(p.c_str(), "w");
-        if (f) {
-            f.print(content);
-            f.close();
-            lua_pushboolean(L, 1);
-            return 1;
-        }
-    }
-    lua_pushboolean(L, 0);
-    return 1;
-}
-
-// --- List files in directory (for Apps-app: Intern / SD) ---
-static int l_file_list_flash(lua_State *L) {
-    const char* path = luaL_checkstring(L, 1);
-    String p = (path[0] == '/') ? String(path) : String("/") + path;
-    lua_newtable(L);
-    int idx = 1;
-    File root = LittleFS.open(p.c_str());
-    if (!root || !root.isDirectory()) return 1;
-    File file = root.openNextFile();
-    while (file) {
-        String n = file.name();
-        int lastSlash = n.lastIndexOf('/');
-        String base = (lastSlash >= 0) ? n.substring(lastSlash + 1) : n;
-        if (base.endsWith(".lua")) {
-            lua_pushstring(L, base.c_str());
-            lua_rawseti(L, -2, idx++);
-        }
-        file.close();
-        file = root.openNextFile();
-    }
-    root.close();
-    return 1;
-}
-
-static int l_file_list_sd(lua_State *L) {
-    const char* path = luaL_checkstring(L, 1);
-    lua_newtable(L);
-    int idx = 1;
-    if (!sdReady) return 1;
-    String p = (path[0] == '/') ? String(path) : String("/") + path;
-    File root = SD.open(p.c_str());
-    if (!root || !root.isDirectory()) return 1;
-    File file = root.openNextFile();
-    while (file) {
-        String n = file.name();
-        file.close();
-        int lastSlash = n.lastIndexOf('/');
-        String base = (lastSlash >= 0) ? n.substring(lastSlash + 1) : n;
-        if (base.endsWith(".lua")) {
-            lua_pushstring(L, base.c_str());
-            lua_rawseti(L, -2, idx++);
-        }
-        file = root.openNextFile();
-    }
-    root.close();
-    return 1;
 }
 
 // --- Display settings (NVS, som RoseOS) ---
@@ -733,411 +376,632 @@ static void saveWiFiConfig() {
     preferences.end();
 }
 
-static int l_display_get_inverted(lua_State *L) {
-    lua_pushboolean(L, displayInverted ? 1 : 0);
-    return 1;
-}
-static int l_display_set_inverted(lua_State *L) {
-    displayInverted = lua_toboolean(L, 1);
-    // Software-inversjon: EPD_FG/EPD_BG oppdateres automatisk, redraw trengs
-    return 0;
-}
-static int l_display_get_refresh_count(lua_State *L) {
-    lua_pushinteger(L, refreshCount);
-    return 1;
-}
-static int l_display_set_refresh_count(lua_State *L) {
-    int n = (int)luaL_checkinteger(L, 1);
-    if (n >= 1 && n <= 3) refreshCount = n;
-    return 0;
-}
-static int l_display_get_partial(lua_State *L) {
-    lua_pushboolean(L, partialRefreshEnabled ? 1 : 0);
-    return 1;
-}
-static int l_display_set_partial(lua_State *L) {
-    partialRefreshEnabled = lua_toboolean(L, 1);
-    return 0;
-}
-static int l_display_save_settings(lua_State *L) {
-    saveDisplaySettings();
-    return 0;
-}
+// ========== Native C++ HAL (for hardkodede apper, uten Lua) ==========
+#define FILE_LIST_MAX 24
+static char fileListNames[FILE_LIST_MAX][32];
+static int fileListCount;
 
-// --- WiFi Bindings ---
-static int l_wifi_connect(lua_State *L) {
-    const char* ssid = luaL_checkstring(L, 1);
-    const char* pass = luaL_checkstring(L, 2);
-    WiFi.begin(ssid, pass);
-    return 0;
-}
-
-static int l_wifi_status(lua_State *L) {
-    lua_pushstring(L, (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED");
-    return 1;
-}
-
-static int l_wifi_get_ip(lua_State *L) {
-    if (WiFi.status() == WL_CONNECTED) {
-        lua_pushstring(L, WiFi.localIP().toString().c_str());
-    } else {
-        lua_pushstring(L, "");
+// Tastatur: returnerer tom streng ved ingen trykk, ellers "ENTER", "LONG_ENTER", "LONG_ENTER_5SEC"
+// BLE kan injisere et trykk via CMD:BUTTON:SHORT / LONG / LONG:5SEC
+static uint8_t s_lastBtn = HIGH;
+static uint32_t s_pressStart = 0;
+static String keyboardGetKey() {
+    if (s_bleInjectedKey.length() > 0) {
+        String k = s_bleInjectedKey;
+        s_bleInjectedKey = "";
+        return k;
     }
-    return 1;
-}
-
-// --- System (for terminal / sysinfo) ---
-static int l_system_get_heap(lua_State *L) {
-    lua_pushinteger(L, (lua_Integer)ESP.getFreeHeap());
-    return 1;
-}
-
-static int l_system_uptime_ms(lua_State *L) {
-    lua_pushinteger(L, (lua_Integer)millis());
-    return 1;
-}
-
-// --- TCP client (for connect/telnet) ---
-static int l_tcp_connect(lua_State *L) {
-    const char* host = luaL_checkstring(L, 1);
-    int port = (int)luaL_optinteger(L, 2, 23);
-    if (tcpClient.connected()) tcpClient.stop();
-    bool ok = tcpClient.connect(host, (uint16_t)port, 5000);
-    lua_pushboolean(L, ok ? 1 : 0);
-    return 1;
-}
-
-static int l_tcp_send(lua_State *L) {
-    const char* str = luaL_checkstring(L, 1);
-    if (tcpClient.connected()) {
-        tcpClient.print(str);
-        lua_pushboolean(L, 1);
-    } else {
-        lua_pushboolean(L, 0);
-    }
-    return 1;
-}
-
-static int l_tcp_available(lua_State *L) {
-    lua_pushinteger(L, (lua_Integer)tcpClient.available());
-    return 1;
-}
-
-static int l_tcp_read(lua_State *L) {
-    int n = (int)luaL_optinteger(L, 1, 1);
-    if (n <= 0 || !tcpClient.connected()) {
-        lua_pushstring(L, "");
-        return 1;
-    }
-    String s;
-    while (n-- > 0 && tcpClient.available()) {
-        char c = (char)tcpClient.read();
-        s += c;
-    }
-    lua_pushstring(L, s.c_str());
-    return 1;
-}
-
-static int l_tcp_connected(lua_State *L) {
-    lua_pushboolean(L, tcpClient.connected() ? 1 : 0);
-    return 1;
-}
-
-static int l_tcp_stop(lua_State *L) {
-    tcpClient.stop();
-    return 0;
-}
-
-// --- Keyboard Binding (langtrykk = LONG_ENTER for å kjøre kommando) ---
-static int l_keyboard_getKey(lua_State *L) {
-    static uint8_t lastBtn = HIGH;
-    static uint32_t pressStart = 0;
     int btn = digitalRead(39);
-    if (btn == LOW && lastBtn == HIGH) {
-        pressStart = millis();
+    if (btn == LOW && s_lastBtn == HIGH) {
+        s_pressStart = millis();
     }
-    if (btn == HIGH && lastBtn == LOW) {
-        lastBtn = HIGH;
-        uint32_t duration = millis() - pressStart;
-        if (duration >= 5000) {
-            lua_pushstring(L, "LONG_ENTER_5SEC");
-        } else if (duration >= 800) {
-            lua_pushstring(L, "LONG_ENTER");
-        } else {
-            lua_pushstring(L, "ENTER");
-        }
-        return 1;
+    if (btn == HIGH && s_lastBtn == LOW) {
+        s_lastBtn = HIGH;
+        uint32_t duration = millis() - s_pressStart;
+        if (duration >= 5000) return String("LONG_ENTER_5SEC");
+        if (duration >= 800)  return String("LONG_ENTER");
+        return String("ENTER");
     }
-    lastBtn = btn;
-    lua_pushnil(L);
-    return 1;
+    s_lastBtn = btn;
+    return String("");
 }
 
-#define LUA_LOADER_BUF_SIZE 4096
-static char lua_loader_buf[LUA_LOADER_BUF_SIZE];
-
-// Laster og kjører launcher.lua (eller forhåndskompilert launcher.luac) fra C.
-// .luac bruker mye mindre minne under lasting enn kompilering av kildekode.
-static int l_load_launcher(lua_State *L) {
-    static bool load_launcher_logged = false;  // Kun én feilmelding for å unngå spam
-    File f;
-    const char *path = nullptr;
-    bool is_bytecode = false;
-    if (littlefsReady) {
-        if (LittleFS.exists("/launcher.luac")) { f = LittleFS.open("/launcher.luac", "r"); path = "@launcher.luac"; is_bytecode = true; }
-        if (!f) { f = LittleFS.open("/launcher.lua", "r"); path = "@launcher.lua"; }
-    }
-    if (!f && spiffsReady) {
-        if (SPIFFS.exists("/launcher.luac")) { f = SPIFFS.open("/launcher.luac", "r"); path = "@launcher.luac"; is_bytecode = true; }
-        if (!f) { f = SPIFFS.open("/launcher.lua", "r"); path = "@launcher.lua"; }
-    }
-    if (!f || f.size() == 0 || (size_t)f.size() >= LUA_LOADER_BUF_SIZE) {
-        if (f) f.close();
-        if (!load_launcher_logged) {
-            load_launcher_logged = true;
-            Serial.println("load_launcher: /launcher.lua (eller .luac) mangler/for stor - kjør Sketch Data Upload eller luac -o launcher.luac launcher.lua");
-        }
-        lua_pushboolean(L, 0);
-        return 1;
-    }
-    size_t n = f.read((uint8_t*)lua_loader_buf, LUA_LOADER_BUF_SIZE - 1);
-    f.close();
-    if (n == 0) {
-        if (!load_launcher_logged) {
-            load_launcher_logged = true;
-            Serial.println("load_launcher: kunne ikke lese fil");
-        }
-        lua_pushboolean(L, 0);
-        return 1;
-    }
-    if (!is_bytecode) lua_loader_buf[n] = '\0';
-    lua_gc(L, LUA_GCCOLLECT, 0);  // Frigjør mest mulig før kompilering (reduserer "not enough memory")
-    if (luaL_loadbuffer(L, lua_loader_buf, n, path) != LUA_OK) {
-        if (!load_launcher_logged) {
-            load_launcher_logged = true;
-            Serial.print("load_launcher: loadbuffer feilet: ");
-            Serial.println(lua_tostring(L, -1));
-        }
-        lua_pop(L, 1);
-        lua_pushboolean(L, 0);
-        return 1;
-    }
-    lua_gc(L, LUA_GCCOLLECT, 0);
-    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
-        if (!load_launcher_logged) {
-            load_launcher_logged = true;
-            Serial.print("load_launcher: pcall feilet: ");
-            Serial.println(lua_tostring(L, -1));
-        }
-        lua_pop(L, 1);
-        lua_pushboolean(L, 0);
-        return 1;
-    }
-    lua_setglobal(L, "launcher");
-    lua_pushboolean(L, 1);
-    return 1;
+static void screenClear() {
+    applyDisplayWindow(true);
+    display.fillScreen(EPD_BG());
+}
+static void screenDrawText(int x, int y, const char* text) {
+    display.setCursor(x, y);
+    display.print(text);
+}
+static void screenSetTextColor(bool white) {
+    display.setTextColor(white ? EPD_BG() : EPD_FG());
+}
+static void screenUpdate() {
+    applyDisplayWindow(false);
+    display.display(partialRefreshEnabled);
+}
+static void screenDrawLine(int x0, int y0, int x1, int y1) {
+    display.drawLine(x0, y0, x1, y1, EPD_FG());
+}
+static void screenFillRect(int x, int y, int w, int h) {
+    display.fillRect(x, y, w, h, EPD_FG());
+}
+static void screenDrawRect(int x, int y, int w, int h) {
+    display.drawRect(x, y, w, h, EPD_FG());
+}
+static void screenSetTextSize(int s) { display.setTextSize(s); }
+static int screenGetWidth() { return display.width(); }
+static int screenGetHeight() { return display.height(); }
+static int screenGetTextWidth(const char* text) {
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+    return (int)w;
 }
 
-// --- Custom Lua Loader (Searcher) ---
-#define LUA_LOADER_DEBUG 0
-#define LUA_HEAP_DEBUG 1
+// Hjem med app-meny (1-basert selected)
+static void screenDrawHomeWithMenu(const char* names[], int n, int selected) {
+    const int gridSlots = 5;
+    const int iconSize = 32;
+    const int gridCols = 5;
+    const int cellW = 250 / gridCols;
+    const int gridY = 38;
+    const int cellH = 52;
+    const int iconXOffset = (cellW - iconSize) / 2;
+    const int iconYOffset = 4;
 
-static int l_vfs_loader(lua_State *L) {
-    const char* name = luaL_checkstring(L, 1);
-    char path[64];
-    
-    // Frigjør Lua-garbage før vi laster (config brukte minne – gi heap til neste modul)
-    lua_gc(L, LUA_GCCOLLECT, 0);
-    
-    // Convert '.' to '/' for Lua module paths (e.g. hal.screen -> hal/screen)
-    String modulePath = String(name);
-    modulePath.replace(".", "/");
-    
-#if LUA_LOADER_DEBUG
-    Serial.printf("[Loader] require('%s') -> path base '%s'\n", name, modulePath.c_str());
-    Serial.printf("[Loader] littlefsReady=%d heap=%u\n", (int)littlefsReady, (unsigned)ESP.getFreeHeap());
-#endif
-#if defined(LUA_HEAP_DEBUG) && LUA_HEAP_DEBUG
-    Serial.printf("[Heap] require('%s'): %u bytes ledig\n", name, (unsigned)ESP.getFreeHeap());
-#endif
-    
-    auto tryLoad = [L](FS& fs, const char* p) -> bool {
-        File f = fs.open(p, "r");
-#if LUA_LOADER_DEBUG
-        Serial.printf("[Loader] open('%s') = %s, size = %d\n", p, f ? "OK" : "FAIL", f ? (int)f.size() : 0);
-#endif
-        if (!f || f.size() == 0) return false;
-        size_t sz = (size_t)f.size();
-        int loadOk = LUA_ERRERR;
-        if (sz < LUA_LOADER_BUF_SIZE) {
-            size_t n = f.read((uint8_t*)lua_loader_buf, sz);
-            f.close();
-            if (n > 0) {
-                lua_loader_buf[n] = '\0';
-                loadOk = luaL_loadbuffer(L, lua_loader_buf, n, p);
+    applyDisplayWindow(true);
+    display.firstPage();
+    do {
+        yield();
+        display.fillScreen(EPD_BG());
+        display.drawBitmap(0, 0, epd_bitmap_home_menu, 250, 122, EPD_FG());
+        drawBatteryIcon(250 - 25, 5);
+        display.setTextSize(1);
+        display.setTextColor(EPD_FG());
+        // Footer: klokke nederst til høyre (størrelse 2 = 100% større)
+        display.setTextSize(2);
+        char timeStr[16];
+        getTimeString(timeStr, sizeof(timeStr), false);
+        int tw = screenGetTextWidth(timeStr);
+        display.setCursor(display.width() - tw - 4, display.height() - 14);
+        display.print(timeStr);
+        display.setTextSize(1);
+
+        for (int i = 0; i < gridSlots; i++) {
+            int cellX = i * cellW;
+            int cellY = gridY;
+            bool selectedCell = (i + 1 == selected);
+
+            if (selectedCell) {
+                display.fillRoundRect(cellX + 1, cellY + 1, cellW - 2, cellH - 2, 3, EPD_FG());
+            } else {
+                display.drawRoundRect(cellX + 1, cellY + 1, cellW - 2, cellH - 2, 3, EPD_FG());
             }
-        } else {
-            String content = f.readString();
-            f.close();
-            loadOk = luaL_loadstring(L, content.c_str());
+
+            if (i < n) {
+                int iconX = cellX + iconXOffset;
+                int iconY = cellY + iconYOffset;
+                const unsigned char* icon = getAppIcon(names[i]);
+                if (selectedCell) {
+                    display.drawBitmap(iconX, iconY, icon, iconSize, iconSize, EPD_BG());
+                } else {
+                    display.drawBitmap(iconX, iconY, icon, iconSize, iconSize, EPD_FG());
+                }
+                int16_t tx1, ty1;
+                uint16_t tw, th;
+                display.getTextBounds(names[i], 0, 0, &tx1, &ty1, &tw, &th);
+                int textX = cellX + (cellW - (int)tw) / 2;
+                int textY = cellY + iconSize + iconYOffset + 2;
+                display.setCursor(textX, textY);
+                if (selectedCell) display.setTextColor(EPD_BG());
+                display.print(names[i]);
+                if (selectedCell) display.setTextColor(EPD_FG());
+            }
         }
-#if LUA_LOADER_DEBUG
-        if (loadOk != LUA_OK) Serial.printf("[Loader] load failed: %s\n", lua_tostring(L, -1));
-#endif
-        if (loadOk == LUA_OK) return true;
-        lua_pop(L, 1);
-        return false;
-    };
-    
-    // Try LittleFS: /hal/screen.lua (åpne direkte – unngår exists() som noen ganger feiler på underkataloger)
-    if (littlefsReady) {
-        snprintf(path, sizeof(path), "/%s.lua", modulePath.c_str());
-        if (tryLoad(LittleFS, path)) return 1;
-        snprintf(path, sizeof(path), "%s.lua", modulePath.c_str());
-        if (tryLoad(LittleFS, path)) return 1;
-    }
-    if (spiffsReady) {
-        snprintf(path, sizeof(path), "/%s.lua", modulePath.c_str());
-        if (tryLoad(SPIFFS, path)) return 1;
-        snprintf(path, sizeof(path), "%s.lua", modulePath.c_str());
-        if (tryLoad(SPIFFS, path)) return 1;
-    }
-    if (sdReady) {
-        snprintf(path, sizeof(path), "/%s.lua", modulePath.c_str());
-        if (tryLoad(SD, path)) return 1;
-    }
-
-    lua_pushfstring(L, "\n\tno file '%s' on Flash or SD", name);
-    return 1;
+    } while (display.nextPage());
 }
 
-void register_hal() {
-    lua_newtable(L);
-    
-    // GPIO Bindings
-    lua_pushcfunction(L, l_gpio_mode); lua_setfield(L, -2, "gpio_mode");
-    lua_pushcfunction(L, l_gpio_write); lua_setfield(L, -2, "gpio_write");
-    lua_pushcfunction(L, l_gpio_read); lua_setfield(L, -2, "gpio_read");
-    
-    // Screen Bindings
-    lua_pushcfunction(L, l_screen_init); lua_setfield(L, -2, "screen_init");
-    lua_pushcfunction(L, l_screen_register_draw); lua_setfield(L, -2, "screen_register_draw");
-    lua_pushcfunction(L, l_screen_unregister_draw); lua_setfield(L, -2, "screen_unregister_draw");
-    lua_pushcfunction(L, l_screen_clear); lua_setfield(L, -2, "screen_clear");
-    lua_pushcfunction(L, l_screen_drawText); lua_setfield(L, -2, "screen_drawText");
-    lua_pushcfunction(L, l_screen_setTextColor); lua_setfield(L, -2, "screen_setTextColor");
-    lua_pushcfunction(L, l_screen_update); lua_setfield(L, -2, "screen_update");
-    lua_pushcfunction(L, l_screen_drawHome); lua_setfield(L, -2, "screen_drawHome");
-    lua_pushcfunction(L, l_screen_drawHomeWithMenu); lua_setfield(L, -2, "screen_drawHomeWithMenu");
-    lua_pushcfunction(L, l_screen_drawLine); lua_setfield(L, -2, "screen_drawLine");
-    lua_pushcfunction(L, l_screen_fillCircle); lua_setfield(L, -2, "screen_fillCircle");
-    lua_pushcfunction(L, l_screen_drawCircle); lua_setfield(L, -2, "screen_drawCircle");
-    lua_pushcfunction(L, l_screen_fillRect); lua_setfield(L, -2, "screen_fillRect");
-    lua_pushcfunction(L, l_screen_drawRect); lua_setfield(L, -2, "screen_drawRect");
-    lua_pushcfunction(L, l_screen_fillTriangle); lua_setfield(L, -2, "screen_fillTriangle");
-    lua_pushcfunction(L, l_screen_getWidth); lua_setfield(L, -2, "screen_getWidth");
-    lua_pushcfunction(L, l_screen_getHeight); lua_setfield(L, -2, "screen_getHeight");
-    lua_pushcfunction(L, l_screen_setTextSize); lua_setfield(L, -2, "screen_setTextSize");
-    lua_pushcfunction(L, l_screen_getTextWidth); lua_setfield(L, -2, "screen_getTextWidth");
+static bool displayGetInverted() { return displayInverted; }
+static void displaySetInverted(bool v) { displayInverted = v; }
+static int displayGetRefreshCount() { return refreshCount; }
+static void displaySetRefreshCount(int v) { if (v >= 1 && v <= 3) refreshCount = v; }
+static bool displayGetPartial() { return partialRefreshEnabled; }
+static void displaySetPartial(bool v) { partialRefreshEnabled = v; }
+static void displaySaveSettingsCpp() { saveDisplaySettings(); }
 
-    // Display settings (invert, partial refresh, refresh count)
-    lua_pushcfunction(L, l_display_get_inverted); lua_setfield(L, -2, "display_get_inverted");
-    lua_pushcfunction(L, l_display_set_inverted); lua_setfield(L, -2, "display_set_inverted");
-    lua_pushcfunction(L, l_display_get_refresh_count); lua_setfield(L, -2, "display_get_refresh_count");
-    lua_pushcfunction(L, l_display_set_refresh_count); lua_setfield(L, -2, "display_set_refresh_count");
-    lua_pushcfunction(L, l_display_get_partial); lua_setfield(L, -2, "display_get_partial");
-    lua_pushcfunction(L, l_display_set_partial); lua_setfield(L, -2, "display_set_partial");
-    lua_pushcfunction(L, l_display_save_settings); lua_setfield(L, -2, "display_save_settings");
-
-    // Delay
-    lua_pushcfunction(L, l_delay_ms); lua_setfield(L, -2, "delay_ms");
-
-    // File read/write
-    lua_pushcfunction(L, l_file_read); lua_setfield(L, -2, "file_read");
-    lua_pushcfunction(L, l_file_write); lua_setfield(L, -2, "file_write");
-    lua_pushcfunction(L, l_file_list_flash); lua_setfield(L, -2, "file_list_flash");
-    lua_pushcfunction(L, l_file_list_sd); lua_setfield(L, -2, "file_list_sd");
-
-    // WiFi Bindings
-    lua_pushcfunction(L, l_wifi_connect); lua_setfield(L, -2, "wifi_connect");
-    lua_pushcfunction(L, l_wifi_status); lua_setfield(L, -2, "wifi_status");
-    lua_pushcfunction(L, l_wifi_get_ip); lua_setfield(L, -2, "wifi_get_ip");
-
-    // System
-    lua_pushcfunction(L, l_system_get_heap); lua_setfield(L, -2, "system_get_heap");
-    lua_pushcfunction(L, l_system_uptime_ms); lua_setfield(L, -2, "system_uptime_ms");
-
-    // TCP client
-    lua_pushcfunction(L, l_tcp_connect); lua_setfield(L, -2, "tcp_connect");
-    lua_pushcfunction(L, l_tcp_send); lua_setfield(L, -2, "tcp_send");
-    lua_pushcfunction(L, l_tcp_available); lua_setfield(L, -2, "tcp_available");
-    lua_pushcfunction(L, l_tcp_read); lua_setfield(L, -2, "tcp_read");
-    lua_pushcfunction(L, l_tcp_connected); lua_setfield(L, -2, "tcp_connected");
-    lua_pushcfunction(L, l_tcp_stop); lua_setfield(L, -2, "tcp_stop");
-
-    // Keyboard Binding
-    lua_pushcfunction(L, l_keyboard_getKey); lua_setfield(L, -2, "keyboard_getKey");
-
-    // Laster launcher.lua fra C (modulær: core + launcher, unngår stack/krasj ved require fra Lua)
-    lua_pushcfunction(L, l_load_launcher); lua_setfield(L, -2, "load_launcher");
-    
-    lua_setglobal(L, "HAL");
-
-    // Register custom file loader: Lua 5.2+ uses package.searchers, Lua 5.1 uses package.loaders
-    lua_getglobal(L, "package");
-    lua_getfield(L, -1, "searchers");
-    if (lua_isnil(L, -1)) {
-        lua_pop(L, 1);
-        lua_getfield(L, -1, "loaders");
-    }
-    if (!lua_isnil(L, -1)) {
-        lua_pushcfunction(L, l_vfs_loader);
-        lua_rawseti(L, -2, 2);
-    }
-    lua_pop(L, 2);
+static bool tcpConnectCpp(const char* host, int port) {
+    if (tcpClient.connected()) tcpClient.stop();
+    return tcpClient.connect(host, (uint16_t)port, 5000);
 }
+static void tcpSendCpp(const char* str) { if (tcpClient.connected()) tcpClient.print(str); }
+static int tcpAvailableCpp() { return tcpClient.available(); }
+static String tcpReadCpp(int maxLen) {
+    String s;
+    while (maxLen-- > 0 && tcpClient.available()) s += (char)tcpClient.read();
+    return s;
+}
+static bool tcpConnectedCpp() { return tcpClient.connected(); }
+static void tcpStopCpp() { tcpClient.stop(); }
+
+static int fileListFlashCpp(const char* path) {
+    String p = (path[0] == '/') ? String(path) : String("/") + path;
+    fileListCount = 0;
+    File root = LittleFS.open(p.c_str());
+    if (!root || !root.isDirectory()) { root.close(); return 0; }
+    File file = root.openNextFile();
+    while (file && fileListCount < FILE_LIST_MAX) {
+        String n = file.name();
+        int lastSlash = n.lastIndexOf('/');
+        String base = (lastSlash >= 0) ? n.substring(lastSlash + 1) : n;
+        if (base.endsWith(".lua") || base.endsWith(".luac")) {
+            String name = base;
+            if (name.endsWith(".luac")) name = name.substring(0, name.length() - 5);
+            else if (name.endsWith(".lua")) name = name.substring(0, name.length() - 4);
+            name.toCharArray(fileListNames[fileListCount], 32);
+            fileListCount++;
+        }
+        file.close();
+        file = root.openNextFile();
+    }
+    root.close();
+    return fileListCount;
+}
+static int fileListSDCpp(const char* path) {
+    fileListCount = 0;
+    if (!sdReady) return 0;
+    String p = (path[0] == '/') ? String(path) : String("/") + path;
+    File root = SD.open(p.c_str());
+    if (!root || !root.isDirectory()) { root.close(); return 0; }
+    File file = root.openNextFile();
+    while (file && fileListCount < FILE_LIST_MAX) {
+        String n = file.name();
+        file.close();
+        int lastSlash = n.lastIndexOf('/');
+        String base = (lastSlash >= 0) ? n.substring(lastSlash + 1) : n;
+        if (base.endsWith(".lua") || base.endsWith(".luac")) {
+            String name = base;
+            if (name.endsWith(".luac")) name = name.substring(0, name.length() - 5);
+            else if (name.endsWith(".lua")) name = name.substring(0, name.length() - 4);
+            name.toCharArray(fileListNames[fileListCount], 32);
+            fileListCount++;
+        }
+        file = root.openNextFile();
+    }
+    root.close();
+    return fileListCount;
+}
+
+// ========== Hardkodede apper (setup/loop) ==========
+static const char* APP_NAMES[] = { "terminal", "clock", "settings", "apps" };
+static const int APP_NAMES_COUNT = 4;
+static int homeSelectedIndex = 1;
+static uint32_t lastHomeClockUpdate = 0;  // for oppdatering av footer-klokke hvert minutt
+static uint32_t homeOpenedAt = 0;  // ignorer LONG_ENTER kort tid etter tilbake til hjem (unngår dobbel åpning)
+
+static void appHome_setup() {
+    homeSelectedIndex = 1;
+    lastHomeClockUpdate = millis();
+    homeOpenedAt = millis();  // nytt hjem – ignorer knapp i 500 ms
+    screenDrawHomeWithMenu(APP_NAMES, APP_NAMES_COUNT, homeSelectedIndex);
+}
+static void appHome_loop() {
+    // Oppdater footer-klokke hvert minutt (partial refresh når partial er på)
+    if (millis() - lastHomeClockUpdate >= 60000) {
+        lastHomeClockUpdate = millis();
+        screenDrawHomeWithMenu(APP_NAMES, APP_NAMES_COUNT, homeSelectedIndex);
+    }
+    String key = keyboardGetKey();
+    if (key.length() == 0) return;
+    // Etter exit fra app: samme langtrykk kan registreres på hjem – ignorer kort tid
+    if (key == "LONG_ENTER" && (millis() - homeOpenedAt < 500))
+        return;
+    if (key == "LONG_ENTER") {
+        int idx = homeSelectedIndex - 1;  // 0-based app index
+        if (idx >= 0 && idx < APP_NAMES_COUNT)
+            launchApp(idx + 1);  // apps[1]=terminal, etc.
+        return;
+    }
+    homeSelectedIndex = (homeSelectedIndex % APP_NAMES_COUNT) + 1;
+    lastHomeClockUpdate = millis();  // reset så vi ikke tegner på nytt med én gang
+    screenDrawHomeWithMenu(APP_NAMES, APP_NAMES_COUNT, homeSelectedIndex);
+}
+
+static void appClock_setup() {
+    screenClear();
+    screenDrawText(10, 10, "Clock");
+    char timeStr[32];
+    getTimeString(timeStr, sizeof(timeStr), true);
+    screenSetTextSize(2);
+    screenDrawText(10, 35, timeStr);
+    screenSetTextSize(1);
+    screenDrawText(10, 95, "Lang trykk = tilbake");
+    screenUpdate();
+}
+static void appClock_loop() {
+    String key = keyboardGetKey();
+    if (key.length() == 0) return;
+    if (key == "LONG_ENTER_5SEC" || key == "LONG_ENTER") {
+        launchApp(0);
+        return;
+    }
+    screenClear();
+    screenDrawText(10, 10, "Clock");
+    char timeStr[32];
+    getTimeString(timeStr, sizeof(timeStr), true);
+    screenSetTextSize(2);
+    screenDrawText(10, 35, timeStr);
+    screenSetTextSize(1);
+    screenDrawText(10, 95, "Lang trykk = tilbake");
+    screenUpdate();
+}
+
+#define TERMINAL_MAX_LINES 10
+#define TERMINAL_LINE_LEN  64
+static char terminalLines[TERMINAL_MAX_LINES][TERMINAL_LINE_LEN];
+static int terminalLineCount;
+static int terminalCmdIndex;
+static bool terminalRemoteMode;
+static const char* terminalCommands[] = { "info", "wifi", "clear", "connect 192.168.1.1", "disconnect", "help", "exit" };
+static const int terminalCommandsCount = 7;
+
+static void terminalAddOutput(const char* line) {
+    if (terminalLineCount >= TERMINAL_MAX_LINES) {
+        for (int i = 0; i < TERMINAL_MAX_LINES - 1; i++)
+            strncpy(terminalLines[i], terminalLines[i + 1], TERMINAL_LINE_LEN - 1);
+        terminalLineCount = TERMINAL_MAX_LINES - 1;
+    }
+    strncpy(terminalLines[terminalLineCount], line, TERMINAL_LINE_LEN - 1);
+    terminalLines[terminalLineCount][TERMINAL_LINE_LEN - 1] = '\0';
+    terminalLineCount++;
+}
+static void terminalRedraw() {
+    screenClear();
+    int y = 0;
+    const int LINE_H = 10;
+    for (int i = 0; i < terminalLineCount; i++) {
+        screenDrawText(0, y, terminalLines[i]);
+        y += LINE_H;
+    }
+    const char* prompt = terminalRemoteMode ? "[TCP] " : "> ";
+    String curCmd = String(prompt) + String(terminalCommands[terminalCmdIndex]);
+    screenDrawText(0, y, curCmd.c_str());
+    screenUpdate();
+}
+static void terminalRunInfo() {
+    terminalAddOutput("-- System --");
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Heap: %u bytes", (unsigned)ESP.getFreeHeap());
+    terminalAddOutput(buf);
+    snprintf(buf, sizeof(buf), "Uptime: %lu s", (unsigned long)(millis() / 1000));
+    terminalAddOutput(buf);
+    terminalAddOutput("");
+}
+static void terminalRunWifi() {
+    terminalAddOutput("-- WiFi --");
+    if (WiFi.status() == WL_CONNECTED) {
+        terminalAddOutput("Status: CONNECTED");
+        terminalAddOutput(("IP: " + WiFi.localIP().toString()).c_str());
+    } else {
+        terminalAddOutput("Status: DISCONNECTED");
+        terminalAddOutput("IP: (ikke koblet)");
+    }
+    terminalAddOutput("");
+}
+static void terminalRunHelp() {
+    terminalAddOutput("-- Kommandoer --");
+    terminalAddOutput("Kort trykk = bytt, Lang = kjør");
+    terminalAddOutput("info   = systeminfo");
+    terminalAddOutput("wifi   = WiFi status/IP");
+    terminalAddOutput("clear  = tøm skjerm");
+    terminalAddOutput("connect IP [port] = TCP (telnet)");
+    terminalAddOutput("disconnect = frakoble TCP");
+    terminalAddOutput("help   = denne hjelpen");
+    terminalAddOutput("exit   = lukk terminal");
+    terminalAddOutput("");
+}
+static void terminalRunCommand(const char* cmd) {
+    if (!cmd || !*cmd) return;
+    if (strcmp(cmd, "info") == 0) { terminalRunInfo(); return; }
+    if (strcmp(cmd, "wifi") == 0) { terminalRunWifi(); return; }
+    if (strcmp(cmd, "clear") == 0) { terminalLineCount = 0; return; }
+    if (strcmp(cmd, "help") == 0) { terminalRunHelp(); return; }
+    if (strcmp(cmd, "exit") == 0) { launchApp(0); return; }
+    if (strncmp(cmd, "connect ", 8) == 0) {
+        const char* rest = cmd + 8;
+        char ip[32] = "192.168.1.1";
+        int port = 23;
+        int a, b, c, d;
+        if (sscanf(rest, "%d.%d.%d.%d", &a, &b, &c, &d) >= 4) {
+            snprintf(ip, sizeof(ip), "%d.%d.%d.%d", a, b, c, d);
+            const char* p = rest;
+            while (*p && *p != ' ') p++;
+            while (*p == ' ') p++;
+            if (*p) port = atoi(p);
+        }
+        terminalAddOutput(("Kobler til " + String(ip) + ":" + String(port) + "...").c_str());
+        terminalRedraw();
+        if (tcpConnectCpp(ip, port)) {
+            terminalRemoteMode = true;
+            terminalAddOutput("Koblet. Lang trykk = disconnect.");
+        } else {
+            terminalAddOutput("Kunne ikke koble til.");
+        }
+        return;
+    }
+    if (strcmp(cmd, "disconnect") == 0) {
+        tcpStopCpp();
+        terminalRemoteMode = false;
+        terminalAddOutput("Frakoblet.");
+        return;
+    }
+    terminalAddOutput(("Ukjent: " + String(cmd) + " (prøv help)").c_str());
+}
+static void appTerminal_setup() {
+    terminalLineCount = 0;
+    terminalCmdIndex = 0;
+    terminalRemoteMode = false;
+    terminalAddOutput("RoseBox Terminal v1.0");
+    terminalAddOutput("Kort=bytt kommando, Lang=kjør");
+    terminalRunHelp();
+    terminalRedraw();
+}
+static void appTerminal_loop() {
+    if (terminalRemoteMode && !tcpConnectedCpp()) {
+        terminalRemoteMode = false;
+        terminalAddOutput("Frakoblet (server lukket).");
+        terminalRedraw();
+        return;
+    }
+    if (terminalRemoteMode && tcpConnectedCpp()) {
+        bool hadData = false;
+        while (tcpAvailableCpp() > 0) {
+            String s = tcpReadCpp(64);
+            if (s.length() > 0) {
+                s.replace("\r", "");
+                terminalAddOutput(s.c_str());
+                hadData = true;
+            }
+        }
+        if (hadData) terminalRedraw();
+    }
+
+    String key = keyboardGetKey();
+    if (key.length() == 0) return;
+
+    if (key == "LONG_ENTER_5SEC") { launchApp(0); return; }
+
+    if (terminalRemoteMode) {
+        if (key == "LONG_ENTER") {
+            tcpStopCpp();
+            terminalRemoteMode = false;
+            terminalAddOutput("Frakoblet.");
+        } else {
+            tcpSendCpp("\n");
+        }
+        terminalRedraw();
+        return;
+    }
+
+    if (key == "LONG_ENTER") {
+        const char* cmd = terminalCommands[terminalCmdIndex];
+        terminalRunCommand(cmd);
+    } else {
+        terminalCmdIndex = (terminalCmdIndex + 1) % terminalCommandsCount;
+    }
+    terminalRedraw();
+}
+
+static int settingsSelectedIndex = 0;
+static const int SETTINGS_LINE_H = 12;
+static const int SETTINGS_ROW_YS[] = { 6, 18, 30, 76 };
+
+static void settingsDrawRow(int y, const char* text, bool selected) {
+    if (selected) {
+        screenFillRect(0, y - 2, screenGetWidth(), SETTINGS_LINE_H + 2);
+        screenSetTextColor(true);
+        screenDrawText(5, y, text);
+        screenSetTextColor(false);
+    } else {
+        screenDrawText(5, y, text);
+    }
+}
+static void settingsRedraw() {
+    screenClear();
+    int y = 6;
+    char buf[48];
+    bool inv = displayGetInverted();
+    snprintf(buf, sizeof(buf), "Inverter: %s", inv ? "ON" : "OFF");
+    settingsDrawRow(y, buf, settingsSelectedIndex == 0);
+    y += SETTINGS_LINE_H;
+    snprintf(buf, sizeof(buf), "Refresh (1-3): %d", displayGetRefreshCount());
+    settingsDrawRow(y, buf, settingsSelectedIndex == 1);
+    y += SETTINGS_LINE_H;
+    snprintf(buf, sizeof(buf), "Partial: %s", displayGetPartial() ? "ON" : "OFF");
+    settingsDrawRow(y, buf, settingsSelectedIndex == 2);
+    y += SETTINGS_LINE_H + 4;
+    screenDrawLine(0, y, screenGetWidth(), y);
+    y += 6;
+    String ipStr = (WiFi.status() == WL_CONNECTED) ? ("IP: " + WiFi.localIP().toString()) : "IP: (ikke koblet)";
+    screenDrawText(5, y, ipStr.c_str());
+    y += SETTINGS_LINE_H + 6;
+    screenDrawLine(0, y, screenGetWidth(), y);
+    y += 6;
+    settingsDrawRow(y, ">>> Lagre og lukk <<<", settingsSelectedIndex == 3);
+    y += SETTINGS_LINE_H + 4;
+    screenDrawText(5, y, "Lang >5s=lagre+hjem");
+    screenUpdate();
+}
+static void appSettings_setup() {
+    settingsSelectedIndex = 0;
+    settingsRedraw();
+}
+static void appSettings_loop() {
+    String key = keyboardGetKey();
+    if (key.length() == 0) return;
+
+    if (key == "LONG_ENTER_5SEC") {
+        displaySaveSettingsCpp();
+        launchApp(0);
+        return;
+    }
+    if (key == "LONG_ENTER") {
+        if (settingsSelectedIndex == 3) {
+            displaySaveSettingsCpp();
+            launchApp(0);
+            return;
+        }
+        if (settingsSelectedIndex == 0) displaySetInverted(!displayGetInverted());
+        if (settingsSelectedIndex == 1) displaySetRefreshCount((displayGetRefreshCount() % 3) + 1);
+        if (settingsSelectedIndex == 2) displaySetPartial(!displayGetPartial());
+        settingsRedraw();
+        return;
+    }
+    settingsSelectedIndex = (settingsSelectedIndex + 1) % 4;
+    settingsRedraw();
+}
+
+static int appsSelectedSide = 1;   // 1=Intern, 2=SD
+static int appsSelectedIndex = 1;
+static int appsInternCount = 0;    // bruker APP_NAMES som "Intern"
+static int appsSDCount = 0;
+#define APPS_DIVIDER_X 125
+
+static void appApps_setup() {
+    appsInternCount = APP_NAMES_COUNT;
+    appsSDCount = fileListSDCpp("/apps");
+    appsSelectedSide = 1;
+    appsSelectedIndex = 1;
+    if (appsInternCount == 0 && appsSDCount > 0) appsSelectedSide = 2;
+
+    screenClear();
+    screenDrawLine(APPS_DIVIDER_X, 0, APPS_DIVIDER_X, screenGetHeight());
+    screenDrawText(5, 2, "Intern");
+    screenDrawText(APPS_DIVIDER_X + 5, 2, "SD");
+    screenDrawLine(0, 14, screenGetWidth(), 14);
+    int yLeft = 18, yRight = 18;
+    for (int i = 0; i < appsInternCount; i++) {
+        char txt[40];
+        snprintf(txt, sizeof(txt), "%s %s", (appsSelectedSide == 1 && appsSelectedIndex == i + 1) ? ">" : " ", APP_NAMES[i]);
+        screenDrawText(5, yLeft, txt);
+        yLeft += 12;
+    }
+    if (appsInternCount == 0) screenDrawText(5, yLeft, "  (ingen)");
+    for (int i = 0; i < appsSDCount && i < FILE_LIST_MAX; i++) {
+        char txt[40];
+        snprintf(txt, sizeof(txt), "%s %s", (appsSelectedSide == 2 && appsSelectedIndex == i + 1) ? ">" : " ", fileListNames[i]);
+        screenDrawText(APPS_DIVIDER_X + 5, yRight, txt);
+        yRight += 12;
+    }
+    if (appsSDCount == 0) screenDrawText(APPS_DIVIDER_X + 5, yRight, "  (ingen)");
+    screenDrawText(5, screenGetHeight() - 12, "Kort=velg  Lang=apne");
+    screenUpdate();
+}
+static void appApps_loop() {
+    String key = keyboardGetKey();
+    if (key.length() == 0) return;
+
+    if (key == "LONG_ENTER_5SEC") { launchApp(0); return; }
+
+    if (key == "LONG_ENTER") {
+        if (appsSelectedSide == 1 && appsSelectedIndex >= 1 && appsSelectedIndex <= appsInternCount) {
+            launchApp(appsSelectedIndex);  // 1-based -> terminal=1, clock=2, ...
+            return;
+        }
+        if (appsSelectedSide == 2) {
+            // SD-lua ikke støttet i native-modus
+            return;
+        }
+        return;
+    }
+
+    if (appsSelectedSide == 1) {
+        if (appsSelectedIndex < appsInternCount) appsSelectedIndex++;
+        else {
+            if (appsSDCount > 0) { appsSelectedSide = 2; appsSelectedIndex = 1; }
+            else appsSelectedIndex = 1;
+        }
+    } else {
+        if (appsSelectedIndex < appsSDCount) appsSelectedIndex++;
+        else { appsSelectedSide = 1; appsSelectedIndex = 1; }
+    }
+
+    screenClear();
+    screenDrawLine(APPS_DIVIDER_X, 0, APPS_DIVIDER_X, screenGetHeight());
+    screenDrawText(5, 2, "Intern");
+    screenDrawText(APPS_DIVIDER_X + 5, 2, "SD");
+    screenDrawLine(0, 14, screenGetWidth(), 14);
+    int yLeft = 18, yRight = 18;
+    for (int i = 0; i < appsInternCount; i++) {
+        char txt[40];
+        snprintf(txt, sizeof(txt), "%s %s", (appsSelectedSide == 1 && appsSelectedIndex == i + 1) ? ">" : " ", APP_NAMES[i]);
+        screenDrawText(5, yLeft, txt);
+        yLeft += 12;
+    }
+    if (appsInternCount == 0) screenDrawText(5, yLeft, "  (ingen)");
+    for (int i = 0; i < appsSDCount && i < FILE_LIST_MAX; i++) {
+        char txt[40];
+        snprintf(txt, sizeof(txt), "%s %s", (appsSelectedSide == 2 && appsSelectedIndex == i + 1) ? ">" : " ", fileListNames[i]);
+        screenDrawText(APPS_DIVIDER_X + 5, yRight, txt);
+        yRight += 12;
+    }
+    if (appsSDCount == 0) screenDrawText(APPS_DIVIDER_X + 5, yRight, "  (ingen)");
+    screenDrawText(5, screenGetHeight() - 12, "Kort=velg  Lang=apne");
+    screenUpdate();
+}
+
+// App-array og launchApp (definert her; deklareret i App.h)
+App apps[APP_COUNT] = {
+    { appHome_setup,    appHome_loop,    "Home" },
+    { appTerminal_setup, appTerminal_loop, "Terminal" },
+    { appClock_setup,   appClock_loop,   "Clock" },
+    { appSettings_setup, appSettings_loop, "Settings" },
+    { appApps_setup,    appApps_loop,    "Apps" },
+};
+App* currentApp = nullptr;
+
+void launchApp(int index) {
+    if (currentApp != nullptr) {
+        // Valgfri cleanup: ingen dynamisk alloc som må frigjøres
+    }
+    if (index < 0 || index >= APP_COUNT) index = 0;
+    currentApp = &apps[index];
+    currentApp->setup();
+}
+
+// (Lua fjernet – native apper bruker C++ HAL)
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n--- RoseBox Boot ---");
+  Serial.println("\n--- RoseBox Boot (native apps) ---");
 
-  // Start WiFi-driver tidlig (unngår "create wifi task: failed to create queue" ved senere WiFi.begin fra BLE)
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
 
-  // false = aldri formatér – ellers kan opplastede filer (Sketch Data Upload) slettes ved mount-feil
   littlefsReady = LittleFS.begin(false);
-  if (littlefsReady) {
-    Serial.println("LittleFS: mounted");
-    Serial.println("  /core.lua: " + String(LittleFS.exists("/core.lua") ? "finnes" : "MANGLER"));
-    Serial.println("  /bootstrap.lua: " + String(LittleFS.exists("/bootstrap.lua") ? "finnes" : "MANGLER"));
-    Serial.println("  /main.lua: " + String(LittleFS.exists("/main.lua") ? "finnes" : "MANGLER"));
-    Serial.println("  /config.lua: " + String(LittleFS.exists("/config.lua") ? "finnes" : "MANGLER"));
-    Serial.println("  /hal/screen.lua: " + String(LittleFS.exists("/hal/screen.lua") ? "finnes" : "MANGLER"));
-  } else {
-    Serial.println("LittleFS: mount failed (velg samme Partition Scheme som ved LittleFS-opplasting, f.eks. Huge APP)");
-  }
+  if (littlefsReady) Serial.println("LittleFS: mounted");
+  else Serial.println("LittleFS: mount failed");
   spiffsReady = SPIFFS.begin(false);
   if (spiffsReady) Serial.println("SPIFFS mounted");
-  if (littlefsReady && writeEmbeddedLuaIfMissing()) {
-    Serial.println("LittleFS: wrote default Lua scripts (first boot)");
-  }
 
   sdReady = SD.begin(SD_CS);
-  if (!sdReady) {
-    Serial.println("SD card fail (CS 13)");
-  }
+  if (!sdReady) Serial.println("SD card fail (CS 13)");
 
-  // Init display: boot med logo + prikker (*, **, ***). Full skjerm 0,0 så ingen åpning på venstre.
   display.init(115200, true, 2, false);
   display.setRotation(1);
   loadDisplaySettings();
   loadWiFiConfig();
-  initBLE();  // må startes tidlig – ESP32 BLE-biblioteket krasjer (StoreProhibited) hvis det kalles etter Lua
-  pinMode(39, INPUT);  // Knapp (LilyGo T5) – må settes her så core/launcher får tastetrykk uten Lua GPIO:setup()
+  // Auto-connect til lagret WiFi ved oppstart (SSID/pass fra NVS)
+  if (wifiStoredSSID.length() > 0) {
+    WiFi.begin(wifiStoredSSID.c_str(), wifiStoredPass.c_str());
+    Serial.println("WiFi: connecting to " + wifiStoredSSID + " ...");
+  }
+  initBLE();
+  pinMode(39, INPUT);
   display.setTextColor(EPD_FG());
 
+  // Boot-animasjon: logo + prikker
   const int screenW = display.width();
   const int screenH = display.height();
   const int bootW = 80, bootH = 50;
@@ -1147,136 +1011,40 @@ void setup() {
   const int dotSpacing = 16;
   const int dotRadius = 3;
   const int dotLeftX = bootX + (bootW - (2 * dotSpacing)) / 2;
-  const int bootDotDelayMs = 150;
 
-  // Hjelpe-lambda: tegne hele boot-skjermen (logo + n fylte prikker: 1=*, 2=**, 3=***)
-  auto drawBootScreen = [&](int numDots) {
-    display.fillRect(0, 0, screenW, screenH, EPD_BG());
-    display.drawBitmap(bootX, bootY, epd_bitmap_boot_logo, bootW, bootH, EPD_FG());
-    for (int i = 0; i < 3; i++) {
-      int cx = dotLeftX + i * dotSpacing;
-      if (i < numDots) {
-        display.fillCircle(cx, dotY, dotRadius, EPD_FG());
-      } else {
-        display.drawCircle(cx, dotY, dotRadius, EPD_FG());
-      }
-    }
-  };
-
-  // Init Lua i små steg mens vi animerer, så animasjonen går til alt er klart
-  int initStep = 0;
-  const int totalFrames = 18;  // lengre animasjon før main.lua kjører
-  bool mainExists = false;
-
-  for (int frame = 0; frame < totalFrames; frame++) {
-    int numDots = (frame % 3) + 1;  // *, **, ***, *, **, ***
-
-    if (frame == 0) {
-      display.setFullWindow();
-    } else {
-      display.setPartialWindow(0, 0, screenW, screenH);
-    }
+  for (int frame = 0; frame < 6; frame++) {
+    int numDots = (frame % 3) + 1;
+    if (frame == 0) display.setFullWindow();
+    else display.setPartialWindow(0, 0, screenW, screenH);
     display.firstPage();
     do {
-        yield();
-        drawBootScreen(numDots);
+      yield();
+      display.fillRect(0, 0, screenW, screenH, EPD_BG());
+      display.drawBitmap(bootX, bootY, epd_bitmap_boot_logo, bootW, bootH, EPD_FG());
+      for (int i = 0; i < 3; i++) {
+        int cx = dotLeftX + i * dotSpacing;
+        if (i < numDots) display.fillCircle(cx, dotY, dotRadius, EPD_FG());
+        else display.drawCircle(cx, dotY, dotRadius, EPD_FG());
+      }
     } while (display.nextPage());
-    // nextPage() gjør refresh – ingen ekstra display() nødvendig
-
-    if (initStep == 0) {
-      L = luaL_newstate();
-      initStep = 1;
-    } else if (initStep == 1) {
-      luaL_openlibs(L);
-      initStep = 2;
-    } else if (initStep == 2) {
-      register_hal();
-      initStep = 3;
-    } else if (initStep == 3) {
-      luaL_dostring(L, "package.path = '/?.lua;/hal/?.lua;/sd/apps/?.lua;/sd/?.lua'");
-      initStep = 4;
-    } else if (initStep == 4) {
-      mainExists = (littlefsReady && (LittleFS.exists("/core.lua") || LittleFS.exists("/bootstrap.lua") || LittleFS.exists("/main.lua")))
-                   || (spiffsReady && (SPIFFS.exists("/core.lua") || SPIFFS.exists("/bootstrap.lua") || SPIFFS.exists("/main.lua")));
-      initStep = 5;
-    }
-
-    delay(bootDotDelayMs);
+    delay(150);
   }
 
-  // Modulær boot: last core.lua (minimal kjerne), deretter laster core launcher via HAL.load_launcher() i første loop().
-  if (L != nullptr && mainExists) {
-#if defined(LUA_HEAP_DEBUG) && LUA_HEAP_DEBUG
-    Serial.printf("[Heap] før core: %u bytes ledig\n", (unsigned)ESP.getFreeHeap());
-#endif
-    bool coreOk = false;
-    File f;
-    if (littlefsReady) f = LittleFS.open("/core.lua", "r");
-    if (!f && spiffsReady) f = SPIFFS.open("/core.lua", "r");
-    if (f && f.size() > 0 && (size_t)f.size() < LUA_LOADER_BUF_SIZE) {
-      size_t n = f.read((uint8_t*)lua_loader_buf, LUA_LOADER_BUF_SIZE - 1);
-      f.close();
-      if (n > 0) {
-        lua_loader_buf[n] = '\0';
-        if (luaL_loadbuffer(L, lua_loader_buf, n, "@core.lua") == LUA_OK) {
-          lua_gc(L, LUA_GCCOLLECT, 0);
-#if defined(LUA_HEAP_DEBUG) && LUA_HEAP_DEBUG
-          Serial.printf("[Heap] etter core load, før run: %u bytes ledig\n", (unsigned)ESP.getFreeHeap());
-#endif
-          if (lua_pcall(L, 0, 0, 0) == LUA_OK) {
-            coreOk = true;
-          }
-        }
-        if (!coreOk && lua_gettop(L) > 0) lua_pop(L, 1);
-      }
-    }
-    if (!coreOk) {
-      lua_gc(L, LUA_GCCOLLECT, 0);
-      if (littlefsReady) f = LittleFS.open("/bootstrap.lua", "r");
-      if (!f && spiffsReady) f = SPIFFS.open("/bootstrap.lua", "r");
-      if (f && f.size() > 0 && (size_t)f.size() < LUA_LOADER_BUF_SIZE) {
-        size_t n = f.read((uint8_t*)lua_loader_buf, LUA_LOADER_BUF_SIZE - 1);
-        f.close();
-        if (n > 0) {
-          lua_loader_buf[n] = '\0';
-          if (luaL_loadbuffer(L, lua_loader_buf, n, "@bootstrap.lua") == LUA_OK) {
-            lua_gc(L, LUA_GCCOLLECT, 0);
-            if (lua_pcall(L, 0, 0, 0) == LUA_OK) coreOk = true;
-          }
-          if (!coreOk && lua_gettop(L) > 0) lua_pop(L, 1);
-        }
-      }
-      if (!coreOk) {
-        lua_getglobal(L, "require");
-        lua_pushstring(L, "main");
-        if (lua_pcall(L, 1, 0, 0) == LUA_OK) coreOk = true;
-        else {
-          Serial.print("Lua Error (main): ");
-          Serial.println(lua_tostring(L, -1));
-          lua_pop(L, 1);
-        }
-      }
-    }
-    if (coreOk) luaReady = true;
-  } else if (L != nullptr && !mainExists) {
-    Serial.println("core.lua / bootstrap.lua / main.lua not found on LittleFS");
-  }
+  launchApp(0);  // Start hjemskjerm
+  Serial.println("RoseBox: native app launcher ready");
 }
 
 void loop() {
-  if (!luaReady || L == nullptr) {
-    delay(100);
-    return;
-  }
   handleBLEConnection();
-  lua_getglobal(L, "loop");
-  if (lua_isfunction(L, -1)) {
-    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-      Serial.println(lua_tostring(L, -1));
-      lua_pop(L, 1);
-    }
-  } else {
-    lua_pop(L, 1);
+  if (bleDataPending) processBLEFromBuffer();
+  // NTP: sett tid én gang når WiFi er koblet (Norge CET+ sommer)
+  if (WiFi.status() == WL_CONNECTED && !ntpConfigDone) {
+    configTime(3600, 3600, "pool.ntp.org", "time.nis.gov");
+    ntpConfigDone = true;
+    Serial.println("NTP: config sent, time will sync shortly");
+  }
+  if (currentApp != nullptr) {
+    currentApp->loop();
   }
   delay(10);
 }
